@@ -13,13 +13,18 @@ import (
 
 /* Functions for parsing module test logs. */
 
+// Data flow from param to msgField
 type DataFlow struct {
 	paramKey string
 	msgField string
 }
+
+// Info about a method called in a test that found flow from a given param
 type testMethod struct {
 	test   string
 	method string
+	// Value of param in the test method (for convenience)
+	paramValue string
 }
 
 // A CType method and corresponding params
@@ -46,18 +51,19 @@ func (m *AllTaint) prettyPrint(filename string) error {
 	defer w.Flush()
 
 	api_call_string_template := "\n%s\n"
-	cf_string_templates := []string{"\tCF\n", "\t\t%s\n", "\t\t\t%s:%s\n"}
-	df_string_templates := []string{"\tDF - TODO!!!\n", "\t\t%s\n", "\t\t\t%s\n", "\t\t\t\t%s:%s\n"}
+	method_string_template := "%s : %s (param set to %s)"
+	cf_string_templates := []string{"\tCF\n", "\t\t%s\n", "\t\t\t" + method_string_template + "\n"}
+	df_string_templates := []string{"\tDF\n", "\t\t%s\n", "\t\t\t%s\n", "\t\t\t\t" + method_string_template + "\n"}
 
 	w.WriteString("***FORMAT***\n")
 	w.WriteString(fmt.Sprintf(api_call_string_template, "API CALL"))
 	w.WriteString(cf_string_templates[0])
 	w.WriteString(fmt.Sprintf(cf_string_templates[1], "Param key"))
-	w.WriteString(fmt.Sprintf(cf_string_templates[2], "Test", "method"))
+	w.WriteString(fmt.Sprintf(cf_string_templates[2], "Test", "method", "<param value>"))
 	w.WriteString(df_string_templates[0])
-	w.WriteString(fmt.Sprintf(df_string_templates[1], "Msg field"))
+	w.WriteString(fmt.Sprintf(df_string_templates[1], "Msg field key"))
 	w.WriteString(fmt.Sprintf(df_string_templates[2], "Param key"))
-	w.WriteString(fmt.Sprintf(df_string_templates[3], "Test", "method"))
+	w.WriteString(fmt.Sprintf(df_string_templates[3], "Test", "method", "<param value>"))
 
 	w.WriteString("\n\n***OUTPUT***\n")
 
@@ -68,8 +74,7 @@ func (m *AllTaint) prettyPrint(filename string) error {
 		for param_key, test_methods := range info.controlFlow {
 			w.WriteString(fmt.Sprintf(cf_string_templates[1], param_key))
 			for _, test_method := range test_methods {
-				w.WriteString(fmt.Sprintf(cf_string_templates[2], test_method.test, test_method.method))
-				// TODO add paramValue (see add())
+				w.WriteString(fmt.Sprintf(cf_string_templates[2], test_method.test, test_method.method, test_method.paramValue))
 			}
 		}
 
@@ -78,8 +83,7 @@ func (m *AllTaint) prettyPrint(filename string) error {
 			w.WriteString(fmt.Sprintf(df_string_templates[1], data_flow.msgField))
 			w.WriteString(fmt.Sprintf(df_string_templates[2], data_flow.paramKey))
 			for _, test_method := range test_methods {
-				w.WriteString(fmt.Sprintf(df_string_templates[3], test_method.test, test_method.method))
-				// TODO add paramValue (see add())
+				w.WriteString(fmt.Sprintf(df_string_templates[3], test_method.test, test_method.method, test_method.paramValue))
 			}
 		}
 
@@ -90,7 +94,7 @@ func (m *AllTaint) prettyPrint(filename string) error {
 
 /*
  * Row: the message log (type and contents)
- * cur_ctype_params: params currently accessible
+ * cur_ctype_params: params currently accessible (via methods currently being called)
  */
 func (m *AllTaint) addFlow(test string, row []string, cur_ctype_params []MethodParams) {
 	api_call_id_bytes := row[1]
@@ -117,23 +121,22 @@ func (m *AllTaint) addFlow(test string, row []string, cur_ctype_params []MethodP
 		existing_flow.dataFlow = make(map[DataFlow][]testMethod)
 	}
 
-	// TODO only compare params and fields that have the same type (requires logging type of both)
 	for _, methodParam := range cur_ctype_params {
 		for _, param := range methodParam.params {
+			test_method := testMethod{test: test, method: methodParam.method, paramValue: param.Value}
 
 			// CF: Msg is CF-tainted by all params
 			// TODO add param.Value to AllTaint for pretty-printing
-			existing_flow.controlFlow[param.Key] = append(existing_flow.controlFlow[param.Key],
-				testMethod{test, methodParam.method})
+			existing_flow.controlFlow[param.Key] = append(existing_flow.controlFlow[param.Key], test_method)
 
-			/*
-			   If match, get:
-			   Msg field key
-
-			   	Param key
-			   		Test:method
-			*/
 			// DF: Msg field is DF-tainted by any params whose content match the field
+			for _, field := range contents {
+				if field.Value == param.Value {
+					// TODO only compare params and fields that have the same type (requires logging type of both)
+					data_flow := DataFlow{paramKey: param.Key, msgField: field.Key}
+					existing_flow.dataFlow[data_flow] = append(existing_flow.dataFlow[data_flow], test_method)
+				}
+			}
 		}
 
 	}
@@ -143,6 +146,7 @@ func (m *AllTaint) addFlow(test string, row []string, cur_ctype_params []MethodP
 
 // test_outfile contains output from one or more tests
 // Combine all the output and put the result in result_outfile
+// TODO write a unit test
 func ParseTestOutput(test_outfile string, result_outfile string) error {
 	file, err := os.Open(test_outfile)
 	if err != nil {
