@@ -3,6 +3,7 @@ package conftamer
 import (
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 )
@@ -55,4 +56,42 @@ func LogAPIMessage(api_call_id APICallID, msg_contents []MsgField) {
 	w.WriteAll([][]string{
 		{MsgLog, string(api_call_id_bytes), string(contents_bytes)},
 	})
+}
+
+// Flatten to k,v pairs of strings - e.g. map[grandparent:map[parent:map[key:value]]] => [grandparent.parent.key:value]
+func unnest(m map[string]interface{}, fields *[]MsgField, key_prefix string, exclude map[string]struct{}) {
+	for k, v := range m {
+		if _, ok := exclude[k]; ok {
+			continue
+		}
+		key := key_prefix + "." + k
+		if key_prefix == "" {
+			key = k
+		}
+		if v_map, ok := v.(map[string]interface{}); ok {
+			unnest(v_map, fields, key, exclude)
+		} else {
+			v_str := fmt.Sprintf("%v", v)
+			(*fields) = append(*fields, MsgField{Key: key, Value: v_str})
+		}
+	}
+}
+
+// Parse fields from any message type by json marshaling it.
+// exclude: fields to be excluded (useful e.g. to ignore fields
+// that are part of the API call ID rather than contents) -
+// ignores entire value corresponding to first instance of the excluded key
+// Note this will skip some but not all empty fields (due to how json.Marshal works)
+func ParseJSONFields(msg_contents any, exclude map[string]struct{}) []MsgField {
+	contents_bytes, err := json.Marshal(msg_contents)
+	if err != nil {
+		log.Panicf("marshaling %+v: %v\n", msg_contents, err.Error())
+	}
+
+	fields := []MsgField{}
+	var contents_map map[string]interface{}
+	json.Unmarshal(contents_bytes, &contents_map)
+	// Each level of json nesting gives another map
+	unnest(contents_map, &fields, "", exclude)
+	return fields
 }
