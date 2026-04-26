@@ -3,7 +3,7 @@
   - CType methods (calls and corresponding CType parameters)
     - Currently done by modules - eventually will be auto-generated on modules' behalf
   - Sent and received API messages
-    Currently done by module tests (often via a mock API client/server package)
+    - Currently done by module tests (often via a mock API client/server package)
 - Program to parse these logs and produce the ConfTamer abstraction for the module that logged them.
 
 ## Implementing ConfTamer in a module

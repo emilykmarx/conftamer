@@ -96,9 +96,10 @@ func (m *AllTaint) prettyPrint(filename string) error {
  * Row: the message log (type and contents)
  * cur_ctype_params: params currently accessible (via methods currently being called)
  */
-func (m *AllTaint) addFlow(test string, row []string, cur_ctype_params []MethodParams) {
-	api_call_id_bytes := row[1]
-	contents_bytes := row[2]
+func (m *AllTaint) addFlow(test string, row []string, cur_ctype_params map[string][]MethodParams) {
+	sending_goroutine := row[1]
+	api_call_id_bytes := row[2]
+	contents_bytes := row[3]
 
 	api_call_id := APICallID{}
 	err := json.Unmarshal([]byte(api_call_id_bytes), &api_call_id)
@@ -121,24 +122,35 @@ func (m *AllTaint) addFlow(test string, row []string, cur_ctype_params []MethodP
 		existing_flow.dataFlow = make(map[DataFlow][]testMethod)
 	}
 
-	for _, methodParam := range cur_ctype_params {
-		for _, param := range methodParam.params {
-			test_method := testMethod{test: test, method: methodParam.method, paramValue: param.Value}
+	// CF: Msg is CF-tainted by all params,
+	// across all in-scope params for now -
+	// TODO: should be only across the in-scope params of the goroutines in the sending one's spawn tree - need to track spawning for that
+	for _, goroutine_params := range cur_ctype_params {
+		for _, methodParam := range goroutine_params {
+			for _, param := range methodParam.params {
+				test_method := testMethod{test: test, method: methodParam.method, paramValue: param.Value}
+				existing_flow.controlFlow[param.Key] = append(existing_flow.controlFlow[param.Key], test_method)
+			}
+		}
+	}
 
-			// CF: Msg is CF-tainted by all params
-			// TODO add param.Value to AllTaint for pretty-printing
-			existing_flow.controlFlow[param.Key] = append(existing_flow.controlFlow[param.Key], test_method)
-
-			// DF: Msg field is DF-tainted by any params whose content match the field
+	// DF: Msg field is DF-tainted by any params whose content match the field,
+	// only considering the CType method that sent the msg (i.e. the most recent entry log from the sending goroutine)
+	all_sending_params := cur_ctype_params[sending_goroutine]
+	if len(all_sending_params) > 0 {
+		cur_sending_params := all_sending_params[len(all_sending_params)-1]
+		for _, param := range cur_sending_params.params {
 			for _, field := range contents {
 				if field.Value == param.Value {
 					// TODO only compare params and fields that have the same type (requires logging type of both)
 					data_flow := DataFlow{paramKey: param.Key, msgField: field.Key}
+					test_method := testMethod{test: test, method: cur_sending_params.method, paramValue: param.Value}
 					existing_flow.dataFlow[data_flow] = append(existing_flow.dataFlow[data_flow], test_method)
 				}
 			}
 		}
-
+	} else {
+		// Send not from a CType method
 	}
 
 	(*m)[api_call_id] = existing_flow
@@ -157,8 +169,8 @@ func ParseTestOutput(test_outfile string, result_outfile string) error {
 	// Allow variable number of fields
 	r.FieldsPerRecord = -1
 
-	// Stack of in-scope methods and their params (last element = most recent)
-	cur_ctype_params := []MethodParams{}
+	// Stack of in-scope methods and their params (last element = most recent), per goroutine
+	cur_ctype_params := make(map[string][]MethodParams)
 	msg_taint := make(AllTaint)
 	cur_test := ""
 
@@ -174,24 +186,29 @@ func ParseTestOutput(test_outfile string, result_outfile string) error {
 			}
 		}
 
+		row_type := row[0]
+
 		// Enter method
-		if row[0] == methodEntryLog {
-			// TODO nested methods: if same CType, doesn't matter - but if different CTypes, take union of params?
+		if row_type == methodEntryLog {
+			goroutine := row[1]
+			method := row[2]
+			params_bytes := row[3]
 			params := []CTypeParam{}
-			err := json.Unmarshal([]byte(row[2]), &params)
+			err := json.Unmarshal([]byte(params_bytes), &params)
 			if err != nil {
-				log.Panicf("unmarshaling %v: %v\n", row[2], err.Error())
+				log.Panicf("unmarshaling %v: %v\n", params_bytes, err.Error())
 			}
-			cur_ctype_params = append(cur_ctype_params, MethodParams{method: row[1], params: params})
-		} else if row[0] == methodExitLog {
+			cur_ctype_params[goroutine] = append(cur_ctype_params[goroutine], MethodParams{method: method, params: params})
+		} else if row_type == methodExitLog {
+			goroutine := row[1]
 			// Pop the exited method's params (this also means we won't count messages not sent during any method)
 			// Note this assumes params' influence ends when the method does, which isn't necc true -
 			// e.g. influence can escape method via function return value, or goroutine spawned in method that persists beyond method exit
-			cur_ctype_params = cur_ctype_params[:len(cur_ctype_params)-1]
-		} else if row[0] == MsgLog {
+			cur_ctype_params[goroutine] = cur_ctype_params[goroutine][:len(cur_ctype_params[goroutine])-1]
+		} else if row_type == MsgLog {
 			msg_taint.addFlow(cur_test, row, cur_ctype_params)
-		} else if strings.HasPrefix(row[0], "=== RUN") || strings.HasPrefix(row[0], "=== CONT") {
-			fields := strings.Fields(row[0])
+		} else if strings.HasPrefix(row_type, "=== RUN") || strings.HasPrefix(row_type, "=== CONT") {
+			fields := strings.Fields(row_type)
 			test := fields[len(fields)-1]
 			cur_test = test
 		} else {

@@ -3,7 +3,6 @@ package conftamer
 import (
 	"encoding/csv"
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 )
@@ -39,7 +38,7 @@ type MsgField struct {
 	Value string
 }
 
-// Modules should call this when they send or receive an API message.
+// Modules should call this when they send or receive an API message (on the sending/receiving goroutine).
 // Log message info: which API call this message corresponds to, and contents
 // TODO messages can be sent concurrently -
 // check if csv writer is concurrency-safe, and match method entry/exit logs to message logs (log goroutine ID)
@@ -54,27 +53,8 @@ func LogAPIMessage(api_call_id APICallID, msg_contents []MsgField) {
 		log.Panicf("marshaling %+v: %v\n", api_call_id, err.Error())
 	}
 	w.WriteAll([][]string{
-		{MsgLog, string(api_call_id_bytes), string(contents_bytes)},
+		{MsgLog, goid(), string(api_call_id_bytes), string(contents_bytes)},
 	})
-}
-
-// Flatten to k,v pairs of strings - e.g. map[grandparent:map[parent:map[key:value]]] => [grandparent.parent.key:value]
-func unnest(m map[string]interface{}, fields *[]MsgField, key_prefix string, exclude map[string]struct{}) {
-	for k, v := range m {
-		if _, ok := exclude[k]; ok {
-			continue
-		}
-		key := key_prefix + "." + k
-		if key_prefix == "" {
-			key = k
-		}
-		if v_map, ok := v.(map[string]interface{}); ok {
-			unnest(v_map, fields, key, exclude)
-		} else {
-			v_str := fmt.Sprintf("%v", v)
-			(*fields) = append(*fields, MsgField{Key: key, Value: v_str})
-		}
-	}
 }
 
 // Parse fields from any message type by json marshaling it.

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"log"
 	"os"
-	"runtime"
 )
 
 /* Functions and interfaces modules should use to log CType methods/params. */
@@ -26,16 +25,7 @@ type CType interface {
 	CTypeParams() []CTypeParam
 }
 
-// Info on caller of function that called this one
-func GetCaller() runtime.Frame {
-	pc := make([]uintptr, 15)
-	n := runtime.Callers(3, pc)
-	frames := runtime.CallersFrames(pc[:n])
-	frame, _ := frames.Next()
-	return frame
-}
-
-// Modules should call this on entry to each of their CTypes methods.
+// Modules should call this on entry to each of their CTypes methods (on the calling goroutine).
 // Log method name and params.
 func LogCTypesMethodEntry(ctype CType) {
 	w := csv.NewWriter(os.Stdout)
@@ -45,15 +35,15 @@ func LogCTypesMethodEntry(ctype CType) {
 		log.Panicf("marshaling %v: %v\n", ctype.CTypeParams(), err.Error())
 	}
 	w.WriteAll([][]string{
-		{methodEntryLog, GetCaller().Func.Name(),
+		{methodEntryLog, goid(), GetCaller().Func.Name(),
 			string(params)},
 	})
 }
 
-// Modules should call this on exit from each of their CTypes methods.
+// Modules should call this on exit from each of their CTypes methods (on the calling goroutine).
 func LogCTypesMethodExit() {
 	w := csv.NewWriter(os.Stdout)
 	w.WriteAll([][]string{
-		{methodExitLog, GetCaller().Func.Name()},
+		{methodExitLog, goid(), GetCaller().Func.Name()},
 	})
 }
