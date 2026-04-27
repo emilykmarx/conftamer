@@ -1,4 +1,4 @@
-package conftamer
+package runtimeinfo
 
 import (
 	"bytes"
@@ -8,24 +8,7 @@ import (
 	"strconv"
 )
 
-// Flatten to k,v pairs of strings - e.g. map[grandparent:map[parent:map[key:value]]] => [grandparent.parent.key:value]
-func unnest(m map[string]interface{}, fields *[]MsgField, key_prefix string, exclude map[string]struct{}) {
-	for k, v := range m {
-		if _, ok := exclude[k]; ok {
-			continue
-		}
-		key := key_prefix + "." + k
-		if key_prefix == "" {
-			key = k
-		}
-		if v_map, ok := v.(map[string]interface{}); ok {
-			unnest(v_map, fields, key, exclude)
-		} else {
-			v_str := fmt.Sprintf("%v", v)
-			(*fields) = append(*fields, MsgField{Key: key, Value: v_str})
-		}
-	}
-}
+/* Info on runtime happenings (likely to be replaced by dlv eventually) */
 
 // Info on caller of function that called this one (on current goroutine)
 func GetCaller() runtime.Frame {
@@ -37,7 +20,7 @@ func GetCaller() runtime.Frame {
 }
 
 // Return current goroutine ID (as string) - panic if can't
-func goid() string {
+func Goid() string {
 	goroutinePrefix := []byte("goroutine ")
 	buf := make([]byte, 32)
 	n := runtime.Stack(buf, false)

@@ -8,9 +8,10 @@
 
 ## Implementing ConfTamer in a module
 
-Modules that implement ConfTamer (possibly via code generation tools and mock API clients/servers) must do the following:
+Modules that implement ConfTamer (possibly via code generation tools and API clients/servers) must do the following:
 - Implement the `CType` interface for each of their CTypes
 - Call `LogCTypesMethodEntry()` and `LogCTypesMethodExit()` in each of their CTypes' methods
+  - (These call `CType` methods)
 - Call `LogAPIMessage()` when sending or receiving an API message in a test
 
 ### Examples
@@ -20,10 +21,14 @@ Modules that implement ConfTamer (possibly via code generation tools and mock AP
 ## Producing the ConfTamer abstraction for a module
 The module must implement ConfTamer as described above.
 
-Run the modules' tests and save the logs to a file.
-Then, run the `conftamer` tool on the log file.
+Then, find the module's CTypes, run its tests, and analyze the test results.
 
 ```
-go build ./cmd/conftamer
-./conftamer --help
+go build ./cmd/ctypes
+go build ./cmd/parse
+./ctypes --help
+./parse --help
 ```
+
+## Repository structure
+`pkg`: Libraries modules can import to implement ConfTamer

@@ -1,18 +1,18 @@
-package conftamer
+package apimessages
 
 import (
 	"encoding/csv"
 	"encoding/json"
 	"log"
 	"os"
+
+	"github.com/emilykmarx/conftamer/runtimeinfo"
 )
 
 /* Functions modules should use to log API messages. */
 
 const (
-	methodEntryLog = "ENTER CTYPES METHOD"
-	methodExitLog  = "EXIT CTYPES METHOD"
-	MsgLog         = "MESSAGE"
+	MsgLog = "MESSAGE"
 )
 
 // Uniquely identifies a sent or received API message.
@@ -53,7 +53,7 @@ func LogAPIMessage(api_call_id APICallID, msg_contents []MsgField) {
 		log.Panicf("marshaling %+v: %v\n", api_call_id, err.Error())
 	}
 	w.WriteAll([][]string{
-		{MsgLog, goid(), string(api_call_id_bytes), string(contents_bytes)},
+		{MsgLog, runtimeinfo.Goid(), string(api_call_id_bytes), string(contents_bytes)},
 	})
 }
 

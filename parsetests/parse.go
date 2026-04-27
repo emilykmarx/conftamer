@@ -1,4 +1,4 @@
-package conftamer
+package parsetests
 
 import (
 	"bufio"
@@ -9,6 +9,9 @@ import (
 	"log"
 	"os"
 	"strings"
+
+	"github.com/emilykmarx/conftamer/pkg/apimessages"
+	"github.com/emilykmarx/conftamer/pkg/ctypes"
 )
 
 /* Functions for parsing module test logs. */
@@ -30,7 +33,7 @@ type testMethod struct {
 // A CType method and corresponding params
 type MethodParams struct {
 	method string
-	params []CTypeParam
+	params []ctypes.CTypeParam
 }
 type APIMessageInfo struct {
 	controlFlow map[string][]testMethod   // param key => tests that found CF from param to msg
@@ -38,7 +41,7 @@ type APIMessageInfo struct {
 }
 
 // Taint info for each msg gathered across all tests (API call ID => influence)
-type AllTaint map[APICallID]APIMessageInfo
+type AllTaint map[apimessages.APICallID]APIMessageInfo
 
 // Eventually may want something more graphable
 func (m *AllTaint) prettyPrint(filename string) error {
@@ -101,12 +104,12 @@ func (m *AllTaint) addFlow(test string, row []string, cur_ctype_params map[strin
 	api_call_id_bytes := row[2]
 	contents_bytes := row[3]
 
-	api_call_id := APICallID{}
+	api_call_id := apimessages.APICallID{}
 	err := json.Unmarshal([]byte(api_call_id_bytes), &api_call_id)
 	if err != nil {
 		log.Panicf("unmarshaling %v: %v\n", api_call_id_bytes, err.Error())
 	}
-	contents := []MsgField{}
+	contents := []apimessages.MsgField{}
 	err = json.Unmarshal([]byte(contents_bytes), &contents)
 	if err != nil {
 		log.Panicf("unmarshaling %v: %v\n", contents_bytes, err.Error())
@@ -189,23 +192,23 @@ func ParseTestOutput(test_outfile string, result_outfile string) error {
 		row_type := row[0]
 
 		// Enter method
-		if row_type == methodEntryLog {
+		if row_type == ctypes.MethodEntryLog {
 			goroutine := row[1]
 			method := row[2]
 			params_bytes := row[3]
-			params := []CTypeParam{}
+			params := []ctypes.CTypeParam{}
 			err := json.Unmarshal([]byte(params_bytes), &params)
 			if err != nil {
 				log.Panicf("unmarshaling %v: %v\n", params_bytes, err.Error())
 			}
 			cur_ctype_params[goroutine] = append(cur_ctype_params[goroutine], MethodParams{method: method, params: params})
-		} else if row_type == methodExitLog {
+		} else if row_type == ctypes.MethodExitLog {
 			goroutine := row[1]
 			// Pop the exited method's params (this also means we won't count messages not sent during any method)
 			// Note this assumes params' influence ends when the method does, which isn't necc true -
 			// e.g. influence can escape method via function return value, or goroutine spawned in method that persists beyond method exit
 			cur_ctype_params[goroutine] = cur_ctype_params[goroutine][:len(cur_ctype_params[goroutine])-1]
-		} else if row_type == MsgLog {
+		} else if row_type == apimessages.MsgLog {
 			msg_taint.addFlow(cur_test, row, cur_ctype_params)
 		} else if strings.HasPrefix(row_type, "=== RUN") || strings.HasPrefix(row_type, "=== CONT") {
 			fields := strings.Fields(row_type)

@@ -4,7 +4,7 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/emilykmarx/conftamer"
+	"github.com/emilykmarx/conftamer/parsetests"
 )
 
 /* Parse the output from a module's tests to produce the ConfTamer abstraction. */
@@ -16,5 +16,5 @@ func main() {
 	flag.Parse()
 	fmt.Printf("Parsing module logs from %v\nWriting output to %v\n", test_outfile, result_outfile)
 
-	conftamer.ParseTestOutput(test_outfile, result_outfile)
+	parsetests.ParseTestOutput(test_outfile, result_outfile)
 }

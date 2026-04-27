@@ -1,13 +1,20 @@
-package conftamer
+package ctypes
 
 import (
 	"encoding/csv"
 	"encoding/json"
 	"log"
 	"os"
+
+	"github.com/emilykmarx/conftamer/runtimeinfo"
 )
 
 /* Functions and interfaces modules should use to log CType methods/params. */
+
+const (
+	MethodEntryLog = "ENTER CTYPES METHOD"
+	MethodExitLog  = "EXIT CTYPES METHOD"
+)
 
 // The key and value of a config param that a CType has access to,
 // via copy or alias.
@@ -21,7 +28,8 @@ type CTypeParam struct {
 type CType interface {
 	// Return all the params that this CType has access to.
 	// TODO (CTypes tool): If param is set to an "uninteresting" value, skip it
-	// (presume the test isn't meant to exercise it).
+	// (presume the test isn't meant to exercise it) - for DF this is taken care of bc JSON marshal omits message fields with `omitempty`,
+	// but still needed for CF
 	CTypeParams() []CTypeParam
 }
 
@@ -35,7 +43,7 @@ func LogCTypesMethodEntry(ctype CType) {
 		log.Panicf("marshaling %v: %v\n", ctype.CTypeParams(), err.Error())
 	}
 	w.WriteAll([][]string{
-		{methodEntryLog, goid(), GetCaller().Func.Name(),
+		{MethodEntryLog, runtimeinfo.Goid(), runtimeinfo.GetCaller().Func.Name(),
 			string(params)},
 	})
 }
@@ -44,6 +52,6 @@ func LogCTypesMethodEntry(ctype CType) {
 func LogCTypesMethodExit() {
 	w := csv.NewWriter(os.Stdout)
 	w.WriteAll([][]string{
-		{methodExitLog, goid(), GetCaller().Func.Name()},
+		{MethodExitLog, runtimeinfo.Goid(), runtimeinfo.GetCaller().Func.Name()},
 	})
 }
