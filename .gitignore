@@ -3,3 +3,5 @@
 /context
 /test_out.log
 /result_out.log
+*.jsonl
+*/__pycache__
