@@ -12,6 +12,11 @@ import (
 // registered handlers. Takes *http.Request as an argument named `req`.
 const HTTPReceiveFunc = "net/http.(*ServeMux).ServeHTTP"
 
+// Inbound request received by Caddy's HTTP server. Fires for all requests
+// handled by caddyhttp (i.e. the reverse proxy and any other Caddy routes),
+// which bypass net/http.ServeMux entirely. Takes *http.Request as `r`.
+const HTTPReceiveFuncCaddy = "github.com/caddyserver/caddy/v2/modules/caddyhttp.(*Server).ServeHTTP"
+
 // Inbound request received (HTTP/2, Go >= 1.27 bundled h2_bundle.go).
 // Parameters: rw *http2responseWriter, req *Request, handler func(ResponseWriter, *Request)
 const HTTPReceiveFuncH2Bundled = "net/http.(*http2serverConn).runHandler"

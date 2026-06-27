@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/emilykmarx/conftamer/contexttrack"
 )
@@ -80,12 +81,13 @@ func main() {
 	}
 
 	handlers := []bpHandler{
-		{bpIDs.ReqReceiveBpIDs,   "Request received",  contexttrack.GetHTTPRequestRecvd},
-		{bpIDs.ReqReceiveH2BpIDs, "Request received",  contexttrack.GetHTTPRequestRecvd},
-		{bpIDs.ReqSendBpIDs,      "Request sent",      contexttrack.GetHTTPRequestSent},
-		{bpIDs.RespSendBpIDs,     "Response sent",     contexttrack.GetHTTPResponseSent},
-		{bpIDs.RespSendH2BpIDs,   "Response sent",     contexttrack.GetHTTPResponseSentH2},
-		{bpIDs.RespRecvBpIDs,     "Response received", contexttrack.GetHTTPResponseRecvd},
+		{bpIDs.ReqReceiveBpIDs,      "Request received", contexttrack.GetHTTPRequestRecvd},
+		{bpIDs.ReqReceiveH2BpIDs,    "Request received", contexttrack.GetHTTPRequestRecvd},
+		{bpIDs.ReqReceiveCaddyBpIDs, "Request received", contexttrack.GetHTTPRequestRecvd},
+		{bpIDs.ReqSendBpIDs,         "Request sent",     contexttrack.GetHTTPRequestSent},
+		{bpIDs.RespSendBpIDs,        "Response sent",    contexttrack.GetHTTPResponseSent},
+		{bpIDs.RespSendH2BpIDs,      "Response sent",    contexttrack.GetHTTPResponseSentH2},
+		{bpIDs.RespRecvBpIDs,        "Response received", contexttrack.GetHTTPResponseRecvd},
 	}
 
 	for {
@@ -99,7 +101,14 @@ func main() {
 			break
 		}
 		if state.Err != nil {
-			fmt.Fprintf(os.Stderr, "Debugger error: %v\n", state.Err)
+			// "connection is shut down" is a race in delve's headless mode: the
+			// process exits and delve closes the RPC before sending state.Exited.
+			// Treat it as a clean exit rather than an error.
+			if strings.Contains(state.Err.Error(), "connection is shut down") {
+				fmt.Println("\nProcess exited (connection closed).")
+			} else {
+				fmt.Fprintf(os.Stderr, "Debugger error: %v\n", state.Err)
+			}
 			break
 		}
 

@@ -10,12 +10,13 @@ import (
 
 // HTTPBreakpointIDs holds the Delve breakpoint ID sets for each HTTP hook point.
 type HTTPBreakpointIDs struct {
-	ReqReceiveBpIDs   map[int]bool
-	ReqReceiveH2BpIDs map[int]bool
-	ReqSendBpIDs      map[int]bool
-	RespSendBpIDs     map[int]bool
-	RespSendH2BpIDs   map[int]bool
-	RespRecvBpIDs     map[int]bool
+	ReqReceiveBpIDs      map[int]bool
+	ReqReceiveH2BpIDs    map[int]bool
+	ReqReceiveCaddyBpIDs map[int]bool
+	ReqSendBpIDs         map[int]bool
+	RespSendBpIDs        map[int]bool
+	RespSendH2BpIDs      map[int]bool
+	RespRecvBpIDs        map[int]bool
 }
 
 func SetHTTPBreakpoints(client *DelveClient) HTTPBreakpointIDs {
@@ -29,8 +30,9 @@ func SetHTTPBreakpoints(client *DelveClient) HTTPBreakpointIDs {
 			SetBreakpointsFor(client, HTTPReceiveFuncH2, "req-received-h2"),
 			SetBreakpointsFor(client, HTTPReceiveFuncH2Bundled, "req-received-h2-bundled"),
 		),
-		ReqSendBpIDs:  SetBreakpointsFor(client, HTTPSendFunc, "req-sent"),
-		RespSendBpIDs: SetBreakpointsFor(client, HTTPResponseFunc, "resp-sent"),
+		ReqReceiveCaddyBpIDs: SetBreakpointsFor(client, HTTPReceiveFuncCaddy, "req-received-caddy"),
+		ReqSendBpIDs:         SetBreakpointsFor(client, HTTPSendFunc, "req-sent"),
+		RespSendBpIDs:        SetBreakpointsFor(client, HTTPResponseFunc, "resp-sent"),
 		RespSendH2BpIDs: mergeSets(
 			SetBreakpointsFor(client, HTTPResponseFuncH2, "resp-sent-h2"),
 			SetBreakpointsFor(client, HTTPResponseFuncH2Bundled, "resp-sent-h2-bundled"),
@@ -111,7 +113,7 @@ type ContextInfo struct {
 func walkContextChain(client *DelveClient, goroutineID, frameID int, expr string, v *api.Variable, indent string) string {
 	cur := expr
 	curAddr := v.Addr
-	for range 5 {
+	for range 15 {
 		found := false
 		for _, getParent := range parentPointers {
 			pe := getParent(cur)
