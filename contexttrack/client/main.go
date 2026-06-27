@@ -53,7 +53,10 @@ func findHandler(handlers []bpHandler, bpID int) (string, func(*contexttrack.Del
 func main() {
 	addr := flag.String("addr", "localhost:2345", "Delve headless server address")
 	output := flag.String("output", "", "JSON Lines file to append events to (one object per line)")
+	verbose := flag.Bool("verbose", false, "print breakpoint and context details to the terminal")
 	flag.Parse()
+
+	contexttrack.Verbose = *verbose
 
 	client := contexttrack.NewDelveClient(*addr)
 
@@ -68,9 +71,13 @@ func main() {
 		defer outFile.Close()
 	}
 
-	fmt.Println("Setting breakpoints:")
+	if *verbose {
+		fmt.Println("Setting breakpoints:")
+	}
 	bpIDs := contexttrack.SetHTTPBreakpoints(client)
-	fmt.Println("Waiting for HTTP events… (Ctrl-C to stop)\n")
+	if *verbose {
+		fmt.Println("Waiting for HTTP events… (Ctrl-C to stop)\n")
+	}
 
 	handlers := []bpHandler{
 		{bpIDs.ReqReceiveBpIDs,   "Request received",  contexttrack.GetHTTPRequestRecvd},
@@ -108,10 +115,12 @@ func main() {
 
 		kind, handler := findHandler(handlers, bpID)
 
-		fmt.Println("╔══════════════════════════════════════════════════════════════╗")
-		fmt.Printf("║  HTTP %s — goroutine %d, thread %d\n", kind, goroutineID, thread.ID)
-		fmt.Printf("║  %s:%d\n", thread.File, thread.Line)
-		fmt.Println("╚══════════════════════════════════════════════════════════════╝")
+		if *verbose {
+			fmt.Println("╔══════════════════════════════════════════════════════════════╗")
+			fmt.Printf("║  HTTP %s — goroutine %d, thread %d\n", kind, goroutineID, thread.ID)
+			fmt.Printf("║  %s:%d\n", thread.File, thread.Line)
+			fmt.Println("╚══════════════════════════════════════════════════════════════╝")
+		}
 
 		var msgData map[string]string
 		if handler != nil {
@@ -134,6 +143,8 @@ func main() {
 			outFile.Write(append(line, '\n'))
 		}
 
-		fmt.Println()
+		if *verbose {
+			fmt.Println()
+		}
 	}
 }

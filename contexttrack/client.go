@@ -4,6 +4,8 @@ package contexttrack
 import (
 	"fmt"
 	"strings"
+
+	"github.com/go-delve/delve/service/api"
 )
 
 // HTTPBreakpointIDs holds the Delve breakpoint ID sets for each HTTP hook point.
@@ -103,52 +105,70 @@ type ContextInfo struct {
 	Error          string      `json:"error,omitempty"`
 }
 
-// walkContextChain walks the context parent chain, prints each step, and returns
-// the root address as a hex string.
-func walkContextChain(client *DelveClient, goroutineID, frameID int, expr, indent string) string {
+// walkContextChain walks the context parent chain starting from an already-eval'd
+// variable, returning the root address as a hex string.
+// Capped at 5 levels — real HTTP context chains are typically 2–4 deep.
+func walkContextChain(client *DelveClient, goroutineID, frameID int, expr string, v *api.Variable, indent string) string {
 	cur := expr
-	for range 20 {
-		moved := false
+	curAddr := v.Addr
+	for range 5 {
+		found := false
 		for _, getParent := range parentPointers {
-			nextExpr := getParent(cur)
-			if _, err := client.EvalVariable(goroutineID, frameID, nextExpr); err == nil {
-				cur = nextExpr
-				moved = true
+			pe := getParent(cur)
+			pv, err := client.EvalVariable(goroutineID, frameID, pe)
+			if err == nil {
+				cur = pe
+				curAddr = pv.Addr
+				found = true
 				break
 			}
 		}
-		if !moved {
-			v, err := client.EvalVariable(goroutineID, frameID, cur)
-			if err != nil {
-				return "?"
-			}
-			addrStr := "?"
-			if v.Addr != 0 {
-				addrStr = fmt.Sprintf("0x%x", v.Addr)
-			}
-			fmt.Printf("%sroot context @ %s\n", indent, addrStr)
-			return addrStr
+		if !found {
+			break
 		}
 	}
-	return "?"
+	addrStr := "?"
+	if curAddr != 0 {
+		addrStr = fmt.Sprintf("0x%x", curAddr)
+	}
+	vprintf("%sroot context @ %s\n", indent, addrStr)
+	return addrStr
+}
+
+// scanFrameVars returns all variables for a frame using the minimal ScanCfg.
+func scanFrameVars(client *DelveClient, goroutineID, frame int) []api.Variable {
+	var result []api.Variable
+	if args, err := client.ScanFunctionArgs(goroutineID, frame); err == nil {
+		result = append(result, args...)
+	}
+	if vars, err := client.ScanLocalVars(goroutineID, frame); err == nil {
+		result = append(result, vars...)
+	}
+	return result
 }
 
 // findContextInFrame searches one stack frame for a context.Context.
+// Uses ScanCfg to cheaply list variable types, then fetches full details only
+// once the context variable is identified.
 func findContextInFrame(client *DelveClient, goroutineID, frameID int, funcName string) *ContextInfo {
-	allVars := GetAllFrameVars(client, goroutineID, frameID)
+	allVars := scanFrameVars(client, goroutineID, frameID)
 
-	// Strategy 1: explicit context.Context variable
+	// Strategy 1: explicit context.Context variable — re-fetch with full LoadCfg for printing.
 	for i := range allVars {
 		v := &allVars[i]
 		if ContextTypes[v.Type] || ContextTypes[strings.TrimPrefix(v.Type, "*")] {
-			fmt.Printf("Context variable found: %s  (%s)\n", v.Name, v.Type)
-			PrintVariable(v, "  ", "    ", 0)
-			rootAddr := walkContextChain(client, goroutineID, frameID, v.Name, "   ")
+			full, err := client.EvalVariable(goroutineID, frameID, v.Name)
+			if err != nil {
+				full = v
+			}
+			vprintf("Context variable found: %s  (%s)\n", full.Name, full.Type)
+			PrintVariable(full, "  ", "    ", 0)
+			rootAddr := walkContextChain(client, goroutineID, frameID, v.Name, full, "   ")
 			return &ContextInfo{Source: v.Name, Type: v.Type, RootAddr: rootAddr}
 		}
 	}
 
-	// Strategies 2–4: find context through a known container type
+	// Strategies 2–4: find context through a known container type.
 	for _, container := range ctxContainers {
 		for i := range allVars {
 			v := &allVars[i]
@@ -160,10 +180,10 @@ func findContextInFrame(client *DelveClient, goroutineID, frameID int, funcName 
 			if err != nil || ctxV.Type == "" {
 				continue
 			}
-			fmt.Println("│")
-			fmt.Printf("└─ Context from %s in frame %d: %s\n", expr, frameID, funcName)
-			fmt.Printf("   type: %s\n", ctxV.Type)
-			rootAddr := walkContextChain(client, goroutineID, frameID, expr, "   ")
+			vprintln("│")
+			vprintf("└─ Context from %s in frame %d: %s\n", expr, frameID, funcName)
+			vprintf("   type: %s\n", ctxV.Type)
+			rootAddr := walkContextChain(client, goroutineID, frameID, expr, ctxV, "   ")
 			return &ContextInfo{Source: expr, Type: ctxV.Type, RootAddr: rootAddr}
 		}
 	}
@@ -173,6 +193,8 @@ func findContextInFrame(client *DelveClient, goroutineID, frameID int, funcName 
 
 // FindContext searches the goroutine's stack for a context.Context by walking up
 // to StackDepth frames. It prints the backtrace and returns the context info found.
+// It first tries a shallow stacktrace (ShallowStackDepth frames) and only fetches
+// the full stack if the context is not found in the top frames.
 //
 // Strategies (tried per frame, in order):
 //  1. Explicit context.Context variable
@@ -181,33 +203,54 @@ func findContextInFrame(client *DelveClient, goroutineID, frameID int, funcName 
 //  4. Context from http.requestAndChan.treq.Request.ctx  (client-side)
 //  5. Context from HTTP/2 response writer (bundled and external)
 func FindContext(client *DelveClient, goroutineID int) *ContextInfo {
-	fmt.Println("\n┌─ Stack backtrace (searching for context.Context) ────────────")
+	vprintln("\n┌─ Stack backtrace (searching for context.Context) ────────────")
 
-	frames, err := client.Stacktrace(goroutineID)
+	frames, err := client.Stacktrace(goroutineID, ShallowStackDepth)
 	if err != nil {
-		fmt.Printf("│  stacktrace error: %v\n", err)
-		fmt.Println("└──────────────────────────────────────────────────────────────")
+		vprintf("│  stacktrace error: %v\n", err)
+		vprintln("└──────────────────────────────────────────────────────────────")
 		return nil
 	}
 
-	var framesVisited []FrameInfo
+	ctx, framesVisited := searchFrames(client, goroutineID, frames, 0)
+	if ctx != nil {
+		vprintln("└──────────────────────────────────────────────────────────────")
+		ctx.FramesSearched = framesVisited
+		return ctx
+	}
+
+	// Not found in shallow pass — fetch the full stack and continue from where we left off.
+	if len(frames) == ShallowStackDepth {
+		deepFrames, err := client.Stacktrace(goroutineID, StackDepth)
+		if err == nil && len(deepFrames) > len(frames) {
+			ctx, moreVisited := searchFrames(client, goroutineID, deepFrames[len(frames):], len(frames))
+			framesVisited = append(framesVisited, moreVisited...)
+			if ctx != nil {
+				vprintln("└──────────────────────────────────────────────────────────────")
+				ctx.FramesSearched = framesVisited
+				return ctx
+			}
+		}
+	}
+
+	vprintln("└──────────────────────────────────────────────────────────────")
+	return &ContextInfo{FramesSearched: framesVisited}
+}
+
+func searchFrames(client *DelveClient, goroutineID int, frames []api.Stackframe, offset int) (*ContextInfo, []FrameInfo) {
+	var visited []FrameInfo
 	for i, frame := range frames {
 		funcName := "<unknown>"
 		if frame.Function != nil {
 			funcName = frame.Function.Name()
 		}
-		fmt.Printf("│  [%2d] %s\n", i, funcName)
-		fmt.Printf("│       %s:%d\n", frame.File, frame.Line)
-		framesVisited = append(framesVisited, FrameInfo{
-			Index: i, Func: funcName, File: frame.File, Line: frame.Line,
-		})
-		if ctx := findContextInFrame(client, goroutineID, i, funcName); ctx != nil {
-			fmt.Println("└──────────────────────────────────────────────────────────────")
-			ctx.FramesSearched = framesVisited
-			return ctx
+		idx := offset + i
+		vprintf("│  [%2d] %s\n", idx, funcName)
+		vprintf("│       %s:%d\n", frame.File, frame.Line)
+		visited = append(visited, FrameInfo{Index: idx, Func: funcName, File: frame.File, Line: frame.Line})
+		if ctx := findContextInFrame(client, goroutineID, idx, funcName); ctx != nil {
+			return ctx, visited
 		}
 	}
-
-	fmt.Println("└──────────────────────────────────────────────────────────────")
-	return &ContextInfo{FramesSearched: framesVisited}
+	return nil, visited
 }

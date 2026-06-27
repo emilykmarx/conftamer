@@ -14,12 +14,12 @@ type DelveClient struct {
 }
 
 func NewDelveClient(addr string) *DelveClient {
-	fmt.Printf("Connecting to Delve at %s…\n", addr)
+	vprintf("Connecting to Delve at %s…\n", addr)
 	return &DelveClient{c: rpc2.NewClient(addr)}
 }
 
 func (d *DelveClient) FindLocation(loc string) ([]api.Location, error) {
-	scope := api.EvalScope{GoroutineID: -1, Frame: 0, DeferredCall: 0}
+	scope := api.EvalScope{GoroutineID: -1}
 	locs, _, err := d.c.FindLocation(scope, loc, false, nil)
 	return locs, err
 }
@@ -32,18 +32,20 @@ func (d *DelveClient) Continue() *api.DebuggerState {
 	return <-d.c.Continue()
 }
 
-func (d *DelveClient) Stacktrace(goroutineID int) ([]api.Stackframe, error) {
-	return d.c.Stacktrace(int64(goroutineID), StackDepth, 0, 0, &LoadCfg)
+func (d *DelveClient) Stacktrace(goroutineID, depth int) ([]api.Stackframe, error) {
+	return d.c.Stacktrace(int64(goroutineID), depth, 0, 0, &LoadCfg)
 }
 
-func (d *DelveClient) ListFunctionArgs(goroutineID, frame int) ([]api.Variable, error) {
+// ScanFunctionArgs lists function args using the minimal ScanCfg (type names only).
+func (d *DelveClient) ScanFunctionArgs(goroutineID, frame int) ([]api.Variable, error) {
 	scope := api.EvalScope{GoroutineID: int64(goroutineID), Frame: frame}
-	return d.c.ListFunctionArgs(scope, LoadCfg)
+	return d.c.ListFunctionArgs(scope, ScanCfg)
 }
 
-func (d *DelveClient) ListLocalVars(goroutineID, frame int) ([]api.Variable, error) {
+// ScanLocalVars lists local variables using the minimal ScanCfg (type names only).
+func (d *DelveClient) ScanLocalVars(goroutineID, frame int) ([]api.Variable, error) {
 	scope := api.EvalScope{GoroutineID: int64(goroutineID), Frame: frame}
-	return d.c.ListLocalVariables(scope, LoadCfg)
+	return d.c.ListLocalVariables(scope, ScanCfg)
 }
 
 func (d *DelveClient) EvalVariable(goroutineID, frame int, expr string) (*api.Variable, error) {
@@ -56,33 +58,21 @@ func (d *DelveClient) EvalVariable(goroutineID, frame int, expr string) (*api.Va
 func SetBreakpointsFor(client *DelveClient, funcName, name string) map[int]bool {
 	locs, err := client.FindLocation(funcName)
 	if err != nil || len(locs) == 0 {
-		fmt.Printf("  WARNING: no locations found for %q — skipping\n", funcName)
+		vprintf("  WARNING: no locations found for %q — skipping\n", funcName)
 		return nil
 	}
 	ids := make(map[int]bool)
 	for _, loc := range locs {
 		bp, err := client.CreateBreakpoint(loc.PC)
 		if err != nil {
-			fmt.Printf("  WARNING: [%s] failed to create breakpoint at 0x%x: %v\n", name, loc.PC, err)
+			vprintf("  WARNING: [%s] failed to create breakpoint at 0x%x: %v\n", name, loc.PC, err)
 			continue
 		}
 		ids[bp.ID] = true
-		fmt.Printf("  [%s] Breakpoint %d at %s:%d (0x%x) for %q\n",
+		vprintf("  [%s] Breakpoint %d at %s:%d (0x%x) for %q\n",
 			name, bp.ID, bp.File, bp.Line, loc.PC, funcName)
 	}
 	return ids
-}
-
-// GetAllFrameVars returns the union of function args and local variables for the given frame.
-func GetAllFrameVars(client *DelveClient, goroutineID, frame int) []api.Variable {
-	var result []api.Variable
-	if args, err := client.ListFunctionArgs(goroutineID, frame); err == nil {
-		result = append(result, args...)
-	}
-	if vars, err := client.ListLocalVars(goroutineID, frame); err == nil {
-		result = append(result, vars...)
-	}
-	return result
 }
 
 // FlatValue returns a one-line summary of a Delve variable.
@@ -120,13 +110,13 @@ func PrintVariable(v *api.Variable, prefix, childPrefix string, depth int) {
 		typeStr = fmt.Sprintf(" (%s)", v.Type)
 	}
 	if v.Value != "" {
-		fmt.Printf("%s%s%s = %s\n", prefix, v.Name, typeStr, v.Value)
+		vprintf("%s%s%s = %s\n", prefix, v.Name, typeStr, v.Value)
 	} else if len(v.Children) > 0 {
-		fmt.Printf("%s%s%s:\n", prefix, v.Name, typeStr)
+		vprintf("%s%s%s:\n", prefix, v.Name, typeStr)
 		for i := range v.Children {
 			PrintVariable(&v.Children[i], childPrefix, childPrefix+"  ", depth+1)
 		}
 	} else {
-		fmt.Printf("%s%s%s\n", prefix, v.Name, typeStr)
+		vprintf("%s%s%s\n", prefix, v.Name, typeStr)
 	}
 }

@@ -1,6 +1,10 @@
 package contexttrack
 
-import "github.com/go-delve/delve/service/api"
+import (
+	"fmt"
+
+	"github.com/go-delve/delve/service/api"
+)
 
 // Breakpoint function names
 
@@ -37,7 +41,14 @@ const HTTPResponseFuncH2 = "golang.org/x/net/http2.(*responseWriter).WriteHeader
 // Network-level failures are not captured here.
 const HTTPRecvResponseFunc = "net/http.redirectBehavior"
 
+// Verbose controls whether diagnostic output is printed to the terminal.
+// Set this before calling any other functions in this package.
+var Verbose bool
+
 const StackDepth = 50
+
+// ShallowStackDepth is tried first; most contexts are found near the top of the stack.
+const ShallowStackDepth = 8
 
 var LoadCfg = api.LoadConfig{
 	FollowPointers:     true,
@@ -45,6 +56,30 @@ var LoadCfg = api.LoadConfig{
 	MaxStringLen:       512,
 	MaxArrayValues:     32,
 	MaxStructFields:    -1,
+}
+
+// ScanCfg is used when scanning frames for a context variable — we only need
+// the type name, so we skip all recursion and value loading.
+var ScanCfg = api.LoadConfig{
+	FollowPointers:     false,
+	MaxVariableRecurse: 0,
+	MaxStringLen:       0,
+	MaxArrayValues:     0,
+	MaxStructFields:    0,
+}
+
+// vprintf prints only when Verbose is true.
+func vprintf(format string, args ...any) {
+	if Verbose {
+		fmt.Printf(format, args...)
+	}
+}
+
+// vprintln prints only when Verbose is true.
+func vprintln(s string) {
+	if Verbose {
+		fmt.Println(s)
+	}
 }
 
 // Concrete types to track for the context.Context interface.
