@@ -175,6 +175,43 @@ def main() -> None:
 
         print()
 
+    # ── group-size summary ────────────────────────────────────────────────
+    size_counts: dict[int, int] = defaultdict(int)
+    for addr in sorted_addrs:
+        size_counts[len(groups[addr])] += 1
+
+    print(f"{'═'*66}")
+    print(f"  Group size summary")
+    print(f"{'═'*66}\n")
+    for size in sorted(size_counts):
+        print(f"  {size} message(s) = {size_counts[size]} group(s)")
+    print()
+
+    # ── kind-pair summary ────────────────────────────────────────────────
+    kind_pair_counts: dict[tuple[str, str], int] = defaultdict(int)
+    for addr in sorted_addrs:
+        kinds_seen: list[str] = []
+        seen_idents: set[tuple] = set()
+        for _, ev in groups[addr]:
+            ident = _ident(ev)
+            if ident not in seen_idents:
+                seen_idents.add(ident)
+                kinds_seen.append(ev.get("kind", "?"))
+        for i in range(len(kinds_seen)):
+            for j in range(i + 1, len(kinds_seen)):
+                kind_pair_counts[(kinds_seen[i], kinds_seen[j])] += 1
+
+    print(f"{'═'*66}")
+    print(f"  Kind-pair summary (ordered pairs)")
+    print(f"{'═'*66}\n")
+    if not kind_pair_counts:
+        print("  (no groups contain more than one unique message)\n")
+    else:
+        for (ka, kb), count in sorted(kind_pair_counts.items(),
+                                      key=lambda x: (-x[1], x[0])):
+            print(f"  {ka} -> {kb}: {count}")
+    print()
+
     # ── global edge summary ───────────────────────────────────────────────
     # For each group, generate all ordered pairs (A, B) from the deduplicated
     # sequence (A appears before B).  Count how many distinct groups each pair
