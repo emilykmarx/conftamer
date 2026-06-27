@@ -57,6 +57,24 @@ $ kill 1623641
 $ curl -s http://localhost:2999/config/ # validate that this returns nothing
 ```
 
+**Major Gotcha 2**: Make sure to disable timeouts:
+
+```
+--- a/caddytest/caddytest.go
++++ b/caddytest/caddytest.go
+@@ -47,8 +47,8 @@ type Config struct {
+ var Default = Config{
+        AdminPort:          2999, // different from what a real server also running on a developer's machine might be
+        Certificates:       []string{"/caddy.localhost.crt", "/caddy.localhost.key"},
+-       TestRequestTimeout: 5 * time.Second,
+-       LoadRequestTimeout: 5 * time.Second,
++       TestRequestTimeout: 60 * time.Second,
++       LoadRequestTimeout: 60 * time.Second,
+ }
+```
+
+**Code and tests**
+
 [Repo](https://github.com/caddyserver/caddy) here. It has a few unit tests and a much more extensive suite of integration tests.
 
 Unit tests:
