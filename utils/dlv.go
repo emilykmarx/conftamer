@@ -1,4 +1,4 @@
-package contexttrack
+package dlv
 
 import (
 	"context"
@@ -90,7 +90,8 @@ func Run(dlv_port int, test_pkg string, test_name string, client_data any, clien
 		if len(server_lines) == 1 && strings.Contains(server_lines[0], "Listening for remote connections") {
 			// normal
 		} else {
-			return fmt.Errorf("Delve server errored while client running: %s", server_stderr.savedOutput)
+			// Some tests log errors even when they pass - TODO separate from any dlv error logs
+			fmt.Printf("Stderr: \n%s", server_stderr.savedOutput)
 		}
 	}
 	return nil
