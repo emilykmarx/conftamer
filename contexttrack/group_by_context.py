@@ -176,15 +176,41 @@ def main() -> None:
         print()
 
     # ── group-size summary ────────────────────────────────────────────────
-    size_counts: dict[int, int] = defaultdict(int)
+    # Deduplicate groups with identical message content (as frozen multiset
+    # for total, frozen set for unique) so repeated root contexts that saw
+    # exactly the same messages are counted once.
+    total_sig_counts: dict[int, int] = defaultdict(int)   # all msgs (with dups)
+    unique_sig_counts: dict[int, int] = defaultdict(int)  # unique msgs only
+
+    seen_total_sigs: set = set()
+    seen_unique_sigs: set = set()
+
     for addr in sorted_addrs:
-        size_counts[len(groups[addr])] += 1
+        all_idents = tuple(sorted(_ident(ev) for _, ev in groups[addr]))
+        unique_idents = frozenset(_ident(ev) for _, ev in groups[addr])
+
+        if all_idents not in seen_total_sigs:
+            seen_total_sigs.add(all_idents)
+            total_sig_counts[len(all_idents)] += 1
+
+        if unique_idents not in seen_unique_sigs:
+            seen_unique_sigs.add(unique_idents)
+            unique_sig_counts[len(unique_idents)] += 1
 
     print(f"{'═'*66}")
-    print(f"  Group size summary")
+    print(f"  Group size summary — all messages (duplicates included)")
+    print(f"  (groups with identical message multisets counted once)")
     print(f"{'═'*66}\n")
-    for size in sorted(size_counts):
-        print(f"  {size} message(s) = {size_counts[size]} group(s)")
+    for size in sorted(total_sig_counts):
+        print(f"  {size} message(s) = {total_sig_counts[size]} group(s)")
+    print()
+
+    print(f"{'═'*66}")
+    print(f"  Group size summary — unique messages per group")
+    print(f"  (groups with identical message sets counted once)")
+    print(f"{'═'*66}\n")
+    for size in sorted(unique_sig_counts):
+        print(f"  {size} message(s) = {unique_sig_counts[size]} group(s)")
     print()
 
     # ── kind-pair summary ────────────────────────────────────────────────
@@ -197,12 +223,11 @@ def main() -> None:
             if ident not in seen_idents:
                 seen_idents.add(ident)
                 kinds_seen.append(ev.get("kind", "?"))
-        for i in range(len(kinds_seen)):
-            for j in range(i + 1, len(kinds_seen)):
-                kind_pair_counts[(kinds_seen[i], kinds_seen[j])] += 1
+        for a, b in zip(kinds_seen, kinds_seen[1:]):
+            kind_pair_counts[(a, b)] += 1
 
     print(f"{'═'*66}")
-    print(f"  Kind-pair summary (ordered pairs)")
+    print(f"  Kind-pair summary (consecutive pairs)")
     print(f"{'═'*66}\n")
     if not kind_pair_counts:
         print("  (no groups contain more than one unique message)\n")
@@ -213,9 +238,8 @@ def main() -> None:
     print()
 
     # ── global edge summary ───────────────────────────────────────────────
-    # For each group, generate all ordered pairs (A, B) from the deduplicated
-    # sequence (A appears before B).  Count how many distinct groups each pair
-    # appears in.
+    # For each group, generate consecutive pairs (A, B) from the deduplicated
+    # sequence.
     edge_counts: dict[tuple[tuple, tuple], int] = defaultdict(int)
 
     for addr in sorted_addrs:
@@ -228,12 +252,11 @@ def main() -> None:
                 seen.add(ident)
                 seq_idents.append(ident)
 
-        for i in range(len(seq_idents)):
-            for j in range(i + 1, len(seq_idents)):
-                edge_counts[(seq_idents[i], seq_idents[j])] += 1
+        for a, b in zip(seq_idents, seq_idents[1:]):
+            edge_counts[(a, b)] += 1
 
     print(f"{'═'*66}")
-    print(f"  Co-occurrence pairs (edges, ordered by appearance in group)")
+    print(f"  Co-occurrence pairs (consecutive only)")
     print(f"{'═'*66}\n")
 
     if not edge_counts:
