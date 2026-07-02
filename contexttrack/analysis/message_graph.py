@@ -2,9 +2,9 @@
 Print message co-occurrence graph edges from events.jsonl.
 
 Each node is a unique message (identified by the key-value pairs in the
-"message" field).  There is an undirected edge between two messages if they
-share a root context address in at least one event group.  Each unique edge
-is printed once.
+"message" field).  There is a directed edge from a message to the message
+that immediately follows it (in arrival order) within the same context
+group.  Each unique edge is printed once.
 
 Run to svg: python3 contexttrack/analysis/message_graph.py --format dot | dot -Tsvg > graph.svg
 """
@@ -80,8 +80,8 @@ def main() -> None:
     def _is_sent(kind: str) -> bool:
         return "sent" in kind.lower()
 
-    # Collect unique directed or undirected edges across all groups
-    edges: set[frozenset] = set()
+    # Collect unique directed edges across all groups
+    edges: set[tuple] = set()
     for root, entries in groups.items():
         if args.recv_sent:
             for i, (ka, kinda) in enumerate(entries):
@@ -89,12 +89,11 @@ def main() -> None:
                     continue
                 for kb, kindb in entries[i + 1:]:
                     if _is_sent(kindb):
-                        edges.add(frozenset([ka, kb]))
+                        edges.add((ka, kb))
         else:
             keys = [k for k, _ in entries]
-            for i in range(len(keys)):
-                for j in range(i + 1, len(keys)):
-                    edges.add(frozenset([keys[i], keys[j]]))
+            for a, b in zip(keys, keys[1:]):
+                edges.add((a, b))
 
     if not edges:
         print("(no edges found)")
@@ -112,14 +111,13 @@ def main() -> None:
                                 if _normalize_key(k)[len("req."):] not in _EXCLUDE_SUFFIXES)
             return f"{kind}\\n{fields}"
 
-        print("graph messages {")
+        print("digraph messages {")
         print('  node [shape=box fontname="monospace" fontsize=10]')
         for k in all_keys:
             label = _dot_label(msg_rep[k]).replace('"', '\\"')
             print(f'  n{node_id[k]} [label="{label}"]')
-        for edge in sorted(edges, key=lambda e: tuple(sorted(node_id[k] for k in e))):
-            a, b = sorted(edge, key=lambda k: node_id[k])
-            print(f"  n{node_id[a]} -- n{node_id[b]}")
+        for a, b in sorted(edges, key=lambda e: (node_id[e[0]], node_id[e[1]])):
+            print(f"  n{node_id[a]} -> n{node_id[b]}")
         print("}")
     else:
         print("Nodes:")
@@ -129,9 +127,8 @@ def main() -> None:
             print(f"  [{node_id[k]}] {kind}  {_msg_label(ev)}")
 
         print(f"\nEdges ({len(edges)}):")
-        for edge in sorted(edges, key=lambda e: tuple(sorted(node_id[k] for k in e))):
-            a, b = sorted(edge, key=lambda k: node_id[k])
-            print(f"  [{node_id[a]}] -- [{node_id[b]}]")
+        for a, b in sorted(edges, key=lambda e: (node_id[e[0]], node_id[e[1]])):
+            print(f"  [{node_id[a]}] -> [{node_id[b]}]")
 
 
 if __name__ == "__main__":

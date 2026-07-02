@@ -2,6 +2,13 @@
 
 Use `run_tests.sh` to run tests, `combine_outputs.sh` to unify files, and the scripts in `analysis/` to analyze context relationships.
 
+Get the full context graph with:
+
+```
+$ cd analysis/
+$ python3 message_graph.py ../events/events.jsonl --format dot | dot -Tsvg > graph.svg
+```
+
 ## Instructions: Manually Run Tests
 
 **Terminal 1**: start target under delve (headless). Note: disable inlining for the HTTP library to ensure all breakpoints are hit. Use `dlv debug` to run a binary and `dlv test` to run tests.
