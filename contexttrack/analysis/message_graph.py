@@ -6,15 +6,15 @@ Each node is a unique message (identified by the key-value pairs in the
 share a root context address in at least one event group.  Each unique edge
 is printed once.
 
-Run to svg: python3 contexttrack/message_graph.py --format dot | dot -Tsvg > graph.svg
+Run to svg: python3 contexttrack/analysis/message_graph.py --format dot | dot -Tsvg > graph.svg
 """
 
 import argparse
-import json
 import re
-import sys
 from collections import defaultdict
 from pathlib import Path
+
+from event_io import load_events
 
 
 _PREFIXES = re.compile(r"^(req|ireq|r)\.")
@@ -63,25 +63,16 @@ def main() -> None:
     # message key -> one representative event (for labelling)
     msg_rep: dict[tuple, dict] = {}
 
-    with open(args.file) as fh:
-        for lineno, line in enumerate(fh, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(f"WARNING: line {lineno}: {e}", file=sys.stderr)
-                continue
-            root = ev.get("context", {}).get("root_addr")
-            if not root or "message" not in ev:
-                continue
-            key = _msg_key(ev)
-            if key not in groups_seen[root]:
-                groups_seen[root].add(key)
-                groups[root].append((key, ev.get("kind", "")))
-            if key not in msg_rep:
-                msg_rep[key] = ev
+    for ev in load_events(args.file):
+        root = ev.get("context", {}).get("root_addr")
+        if not root or "message" not in ev:
+            continue
+        key = _msg_key(ev)
+        if key not in groups_seen[root]:
+            groups_seen[root].add(key)
+            groups[root].append((key, ev.get("kind", "")))
+        if key not in msg_rep:
+            msg_rep[key] = ev
 
     def _is_received(kind: str) -> bool:
         return "received" in kind.lower()

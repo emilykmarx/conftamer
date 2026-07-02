@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import argparse
-import json
 from collections import Counter
-from pathlib import Path
+
+from event_io import load_events
 
 
 def parse_events(path: str) -> None:
@@ -10,23 +10,17 @@ def parse_events(path: str) -> None:
     source_counts: Counter = Counter()
     frames_searched_counts: Counter = Counter()
 
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            event = json.loads(line)
+    for event in load_events(path):
+        if "file" in event:
+            file_counts[event["file"]] += 1
 
-            if "file" in event:
-                file_counts[event["file"]] += 1
+        ctx = event.get("context", {})
+        if "source" in ctx:
+            source_counts[ctx["source"]] += 1
 
-            ctx = event.get("context", {})
-            if "source" in ctx:
-                source_counts[ctx["source"]] += 1
-
-            frames = ctx.get("frames_searched")
-            if isinstance(frames, list):
-                frames_searched_counts[len(frames)] += 1
+        frames = ctx.get("frames_searched")
+        if isinstance(frames, list):
+            frames_searched_counts[len(frames)] += 1
 
     print("=== File counts ===")
     for file, count in file_counts.most_common():

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run caddy integration tests in parallel under delve, one per network namespace.
 # Requires: sudo unshare (add to sudoers: ALL=(root) NOPASSWD: /usr/bin/unshare)
-# Usage: bash run_tests.sh [--filter PATTERN] [--jobs N] [--rebuild] [--test-timeout DURATION]
+# Usage: bash run_tests.sh [--filter PATTERN] [--jobs N] [--rebuild] [--test-timeout DURATION] [--wall-timeout DURATION]
 set -euo pipefail
 
 CADDY_DIR="${CADDY_DIR:-/home/tcr6/caddy}"

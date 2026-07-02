@@ -15,6 +15,8 @@ import json
 import sys
 from collections import defaultdict
 
+from event_io import load_events
+
 
 # ── message identifier ───────────────────────────────────────────────────────
 # A stable (kind, verb, path, code) tuple used for display and deduplication.
@@ -110,19 +112,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── load ──────────────────────────────────────────────────────────────────
-    events = []
-    try:
-        with open(args.input) as f:
-            for lineno, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError as e:
-                    print(f"WARNING: line {lineno}: {e}", file=sys.stderr)
-    except FileNotFoundError:
-        sys.exit(f"File not found: {args.input}")
+    events = list(load_events(args.input))
 
     if not events:
         sys.exit("No events found.")

@@ -1,3 +1,4 @@
+// Shared constants, config, and helpers used across the contexttrack package.
 package contexttrack
 
 import (
