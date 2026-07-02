@@ -5,3 +5,5 @@
 /result_out.log
 *.jsonl
 */__pycache__
+/contexttrack/events
+*.svg
