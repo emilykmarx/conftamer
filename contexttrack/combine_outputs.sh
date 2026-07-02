@@ -3,7 +3,7 @@
 # Usage: bash combine_outputs.sh [OUTPUT_DIR]
 set -euo pipefail
 
-OUTPUT_DIR="${1:-$(dirname "$0")/contexttrack/events}"
+OUTPUT_DIR="${1:-$(dirname "$0")/events}"
 EVENTS_OUT="${OUTPUT_DIR}/events.jsonl"
 TESTS_OUT="${OUTPUT_DIR}/tests.log"
 

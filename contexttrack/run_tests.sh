@@ -4,13 +4,13 @@
 # Usage: bash run_tests.sh [--filter PATTERN] [--jobs N] [--rebuild] [--test-timeout DURATION]
 set -euo pipefail
 
-CADDY_DIR=/home/tcr6/caddy
-CONFTAMER_DIR=/home/tcr6/conftamer
-OUTPUT_DIR="${CONFTAMER_DIR}/contexttrack/events"
-TEST_BIN=/tmp/integration-$(id -un).test
-CLIENT_BIN=/tmp/contexttrack-client-$(id -un)
-GO=/usr/lib/go-1.22/bin/go
-DLV=/home/tcr6/go/bin/dlv
+CADDY_DIR="${CADDY_DIR:-/home/tcr6/caddy}"
+CONFTAMER_DIR="${CONFTAMER_DIR:-/home/tcr6/conftamer}"
+OUTPUT_DIR="${OUTPUT_DIR:-${CONFTAMER_DIR}/contexttrack/events}"
+TEST_BIN="${TEST_BIN:-/tmp/integration-$(id -un).test}"
+CLIENT_BIN="${CLIENT_BIN:-/tmp/contexttrack-client-$(id -un)}"
+GO="${GO:-/usr/lib/go-1.22/bin/go}"
+DLV="${DLV:-/home/tcr6/go/bin/dlv}"
 JOBS=$(nproc)
 FILTER='.*'
 FORCE_REBUILD=0
