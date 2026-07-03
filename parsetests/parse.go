@@ -3,6 +3,7 @@ package parsetests
 import (
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 
@@ -21,29 +22,42 @@ type APIMessageInfo struct {
 // Info for each msg gathered across all tests (API call ID => influence)
 type AllTaint map[apimessages.APICallID]APIMessageInfo
 
-func InsertToParamHierarchy(m ParamHierarchy, parts []string) {
-	// Keep indexing until prefix doesn't match, then insert the rest of the prefix
+func InsertToParamHierarchy(m ParamHierarchy, parts []string, api_call_id string, recvr_type string,
+	full_key string) { // just for logging
+
 	if len(parts) == 0 {
 		return
 	}
 	part := parts[0]
-	if len(parts) == 1 {
-		if _, ok := m[part]; ok {
-			// Already inserted full key
+	if key_info, ok := m[part]; ok {
+		if _, ok := key_info.(string); ok {
+			if len(parts) != 1 {
+				// e.g. already inserted a, found a.b => overwrite a
+				fmt.Printf("Found full key %v but recorded prefix ending in %v as influencing %v - overwriting prefix influence\n", full_key, part, key_info)
+				m[part] = make(map[string]interface{})
+				InsertToParamHierarchy(m[part].(map[string]interface{}), parts[1:], api_call_id, recvr_type, full_key)
+			} else {
+				// Already inserted full key => add this {msg, recvr} pair
+				m[part] = fmt.Sprintf("%v,%v,%v", key_info.(string), api_call_id, recvr_type)
+			}
 		} else {
-			// Insert last part
-			m[part] = make(map[string]interface{})
+			if len(parts) == 1 {
+				// e.g. already inserted a.b, found a => skip a
+				fmt.Printf("Found full key %v but postfix %v exists - skipping full key\n", full_key, key_info)
+			} else {
+				// Insert to existing map
+				InsertToParamHierarchy(key_info.(map[string]interface{}), parts[1:], api_call_id, recvr_type, full_key)
+			}
 		}
-		return
-	}
-
-	if v_map, ok := m[part]; ok {
-		// insert to existing map
-		InsertToParamHierarchy(v_map.(map[string]interface{}), parts[1:])
 	} else {
-		// add map for rest of parts
-		m[part] = make(map[string]interface{})
-		InsertToParamHierarchy(m[part].(map[string]interface{}), parts[1:])
+		if len(parts) == 1 {
+			// Last part => insert key
+			m[part] = fmt.Sprintf("%v,%v", api_call_id, recvr_type)
+		} else {
+			// Add map for rest of parts
+			m[part] = make(map[string]interface{})
+			InsertToParamHierarchy(m[part].(map[string]interface{}), parts[1:], api_call_id, recvr_type, full_key)
+		}
 	}
 }
 
@@ -54,10 +68,11 @@ func (m *AllTaint) DumpHierarchy(filename string) error {
 	// Arrange all observed params into hierarchy
 	param_hierarchy := make(ParamHierarchy)
 
-	for _, msg_info := range *m {
-		for _, keys := range msg_info.controlFlow {
+	for api_call_id, msg_info := range *m {
+		for recvr_type, keys := range msg_info.controlFlow {
 			for _, key := range keys {
-				InsertToParamHierarchy(param_hierarchy, strings.Split(key, "."))
+				api_call_str := fmt.Sprintf("%v:%v/%v", api_call_id.API, api_call_id.Verb, api_call_id.Resource)
+				InsertToParamHierarchy(param_hierarchy, strings.Split(key, "."), api_call_str, recvr_type, key)
 			}
 		}
 	}
@@ -86,10 +101,10 @@ func (m *AllTaint) Dump(filename string) error {
 			"API", "Verb", "Resource", "CType", "Param key",
 		}}
 
-	for api_call_ID, msg_info := range *m {
+	for api_call_id, msg_info := range *m {
 		for recvr_type, keys := range msg_info.controlFlow {
 			// Row for each recvr that sends this msg
-			row := []string{api_call_ID.API, api_call_ID.Verb, api_call_ID.Resource}
+			row := []string{api_call_id.API, api_call_id.Verb, api_call_id.Resource}
 			row = append(row, recvr_type)
 			row = append(row, keys...)
 			rows = append(rows, row)
@@ -101,7 +116,7 @@ func (m *AllTaint) Dump(filename string) error {
 		return err
 	}
 
-	return m.DumpHierarchy("hierarchy_" + filename)
+	return m.DumpHierarchy(filename + "_hierarchy")
 }
 
 func (m *AllTaint) AddCTypeMethodCall(api_call_id apimessages.APICallID, param_keys []string, recvr_type string) {
