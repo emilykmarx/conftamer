@@ -3,7 +3,9 @@ package parsetests
 import (
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/emilykmarx/conftamer/pkg/apimessages"
@@ -12,8 +14,6 @@ import (
 /* Functions for recording info during tests. */
 type ParamKeys []string
 
-type ParamHierarchy map[string]interface{}
-
 type APIMessageInfo struct {
 	controlFlow map[string]ParamKeys // receiver => param keys it accesses
 }
@@ -21,30 +21,68 @@ type APIMessageInfo struct {
 // Info for each msg gathered across all tests (API call ID => influence)
 type AllTaint map[apimessages.APICallID]APIMessageInfo
 
-func InsertToParamHierarchy(m ParamHierarchy, parts []string) {
-	// Keep indexing until prefix doesn't match, then insert the rest of the prefix
+type ParamHierarchy map[string]HierarchyValue
+type HierarchyValue struct {
+	// Msgs influenced by key paths ending with this one
+	Msgs string `json:",omitempty"`
+	// paths to postfixes
+	Fields map[string]HierarchyValue `json:" ,omitempty"`
+}
+
+func InsertToParamHierarchy(m ParamHierarchy, parts []string, api_call_id string) {
 	if len(parts) == 0 {
 		return
 	}
 	part := parts[0]
-	if len(parts) == 1 {
-		if _, ok := m[part]; ok {
-			// Already inserted full key
+	if key_info, ok := m[part]; ok {
+		if len(parts) == 1 {
+			// Already inserted full key => add this {msg, recvr} pair
+			if !strings.Contains(key_info.Msgs, api_call_id) {
+				key_info.Msgs = fmt.Sprintf("%v %v", key_info.Msgs, api_call_id)
+				m[part] = key_info
+			}
 		} else {
-			// Insert last part
-			m[part] = make(map[string]interface{})
+			// Insert rest of parts to existing map
+			InsertToParamHierarchy(key_info.Fields, parts[1:], api_call_id)
 		}
-		return
-	}
-
-	if v_map, ok := m[part]; ok {
-		// insert to existing map
-		InsertToParamHierarchy(v_map.(map[string]interface{}), parts[1:])
 	} else {
-		// add map for rest of parts
-		m[part] = make(map[string]interface{})
-		InsertToParamHierarchy(m[part].(map[string]interface{}), parts[1:])
+		// Add part, with map for rest of parts
+		val := HierarchyValue{
+			Fields: make(map[string]HierarchyValue),
+		}
+		if len(parts) == 1 {
+			// Last part => insert msg
+			val.Msgs = api_call_id
+			m[part] = val
+		} else {
+			// More parts => insert them
+			m[part] = val
+			InsertToParamHierarchy(m[part].Fields, parts[1:], api_call_id)
+		}
 	}
+}
+
+func (m ParamHierarchy) Marshal() []byte {
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	pretty := strings.ReplaceAll(string(b), "\"", "")
+	pretty = strings.ReplaceAll(pretty, "{", "")
+	pretty = strings.ReplaceAll(pretty, "}", "")
+	pretty = strings.ReplaceAll(pretty, ":", "")
+	pretty = strings.ReplaceAll(pretty, ",", "")
+	re := regexp.MustCompile("\n +\n")
+	for {
+		before_replace := pretty
+		pretty = string(re.ReplaceAll([]byte(pretty), []byte("\n")))
+		if pretty == before_replace {
+			break
+		}
+	}
+	re = regexp.MustCompile("\n +Msgs +")
+	pretty = string(re.ReplaceAll([]byte(pretty), []byte("=> ")))
+	return []byte(pretty)
 }
 
 // PARAM-FOCUSED FORMAT:
@@ -54,18 +92,16 @@ func (m *AllTaint) DumpHierarchy(filename string) error {
 	// Arrange all observed params into hierarchy
 	param_hierarchy := make(ParamHierarchy)
 
-	for _, msg_info := range *m {
+	for api_call_id, msg_info := range *m {
 		for _, keys := range msg_info.controlFlow {
 			for _, key := range keys {
-				InsertToParamHierarchy(param_hierarchy, strings.Split(key, "."))
+				api_call_str := fmt.Sprintf("%v-%v/%v", api_call_id.API, api_call_id.Verb, api_call_id.Resource)
+				InsertToParamHierarchy(param_hierarchy, strings.Split(key, "."), api_call_str)
 			}
 		}
 	}
 
-	b, err := json.MarshalIndent(param_hierarchy, "", "  ")
-	if err != nil {
-		return err
-	}
+	b := param_hierarchy.Marshal()
 
 	return os.WriteFile(filename, b, 0666)
 }
@@ -86,10 +122,10 @@ func (m *AllTaint) Dump(filename string) error {
 			"API", "Verb", "Resource", "CType", "Param key",
 		}}
 
-	for api_call_ID, msg_info := range *m {
+	for api_call_id, msg_info := range *m {
 		for recvr_type, keys := range msg_info.controlFlow {
 			// Row for each recvr that sends this msg
-			row := []string{api_call_ID.API, api_call_ID.Verb, api_call_ID.Resource}
+			row := []string{api_call_id.API, api_call_id.Verb, api_call_id.Resource}
 			row = append(row, recvr_type)
 			row = append(row, keys...)
 			rows = append(rows, row)
@@ -101,7 +137,7 @@ func (m *AllTaint) Dump(filename string) error {
 		return err
 	}
 
-	return m.DumpHierarchy("hierarchy_" + filename)
+	return m.DumpHierarchy(filename + "_hierarchy")
 }
 
 func (m *AllTaint) AddCTypeMethodCall(api_call_id apimessages.APICallID, param_keys []string, recvr_type string) {
