@@ -27,12 +27,12 @@ import (
 
 // event is the JSON record written to the output file for each HTTP breakpoint hit.
 type event struct {
-	Kind        string            `json:"kind"`
-	GoroutineID int               `json:"goroutine_id"`
-	ThreadID    int               `json:"thread_id"`
-	File        string            `json:"file"`
-	Line        int               `json:"line"`
-	Message     map[string]string `json:"message"`
+	Kind        string                    `json:"kind"`
+	GoroutineID int                       `json:"goroutine_id"`
+	ThreadID    int                       `json:"thread_id"`
+	File        string                    `json:"file"`
+	Line        int                       `json:"line"`
+	Message     map[string]string         `json:"message"`
 	Context     *contexttrack.ContextInfo `json:"context"`
 }
 
@@ -81,13 +81,18 @@ func main() {
 	}
 
 	handlers := []bpHandler{
-		{bpIDs.ReqReceiveBpIDs,      "Request received", contexttrack.GetHTTPRequestRecvd},
-		{bpIDs.ReqReceiveH2BpIDs,    "Request received", contexttrack.GetHTTPRequestRecvd},
+		{bpIDs.ReqReceiveBpIDs, "Request received", contexttrack.GetHTTPRequestRecvd},
+		{bpIDs.ReqReceiveH2BpIDs, "Request received", contexttrack.GetHTTPRequestRecvd},
 		{bpIDs.ReqReceiveCaddyBpIDs, "Request received", contexttrack.GetHTTPRequestRecvd},
-		{bpIDs.ReqSendBpIDs,         "Request sent",     contexttrack.GetHTTPRequestSent},
-		{bpIDs.RespSendBpIDs,        "Response sent",    contexttrack.GetHTTPResponseSent},
-		{bpIDs.RespSendH2BpIDs,      "Response sent",    contexttrack.GetHTTPResponseSentH2},
-		{bpIDs.RespRecvBpIDs,        "Response received", contexttrack.GetHTTPResponseRecvd},
+		{bpIDs.ReqReceiveCaddyRouteBpIDs, "Request received", contexttrack.GetHTTPRequestRecvd},
+		{bpIDs.ReqReceivePromHTTPBpIDs, "Request received", contexttrack.GetHTTPRequestRecvd},
+		{bpIDs.ReqSendBpIDs, "Request sent", contexttrack.GetHTTPRequestSent},
+		{bpIDs.RespSendBpIDs, "Response sent", contexttrack.GetHTTPResponseSent},
+		{bpIDs.RespSendH2BpIDs, "Response sent", contexttrack.GetHTTPResponseSentH2},
+		{bpIDs.RespSendCaddyBpIDs, "Response sent", contexttrack.GetCaddyResponseSent},
+		{bpIDs.RespSendRecorderBpIDs, "Response sent", contexttrack.GetHTTPResponseSentRecorder},
+		{bpIDs.RespSendPromHTTPBpIDs, "Response sent", contexttrack.GetPromHTTPResponseSent},
+		{bpIDs.RespRecvBpIDs, "Response received", contexttrack.GetHTTPResponseRecvd},
 	}
 
 	for {

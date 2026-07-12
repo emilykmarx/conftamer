@@ -76,6 +76,38 @@ func GetHTTPResponseSentH2(client *DelveClient, goroutineID int) map[string]stri
 		[]string{"code", "w.rws.req.Method", "w.rws.req.URL.Path"})
 }
 
+// GetCaddyResponseSent handles caddyhttp.(*responseRecorder).WriteHeader.
+// Unlike GetHTTPResponseSent, the receiver (rr) has no req field, so method
+// and path aren't available here; FindContext walks up to the caller's
+// *http.Request to resolve context instead.
+func GetCaddyResponseSent(client *DelveClient, goroutineID int) map[string]string {
+	return printAndCollect(client, goroutineID,
+		"HTTP Response (message being sent, Caddy layer) ───────────",
+		[]string{"statusCode"})
+}
+
+// GetHTTPResponseSentRecorder handles httptest.(*ResponseRecorder).WriteHeader.
+// Like GetCaddyResponseSent, the receiver (rw) has no req field, so method
+// and path aren't available here; FindContext walks up to the caller's
+// *http.Request to resolve context instead.
+func GetHTTPResponseSentRecorder(client *DelveClient, goroutineID int) map[string]string {
+	return printAndCollect(client, goroutineID,
+		"HTTP Response (message being sent, httptest.ResponseRecorder) ─",
+		[]string{"code"})
+}
+
+// GetPromHTTPResponseSent handles the HTTPResponseFuncPromHTTPReturn fallback
+// breakpoint (end of promhttp.HandlerForTransactional.func1). Unlike
+// GetHTTPResponseSentRecorder, req/method/path are available directly since
+// we're still in the handler's own frame — but the status code isn't: it
+// lives on whichever unexported delegator type promhttp wrapped rsp in
+// (varies with the ResponseWriter's capabilities), not worth hardcoding.
+func GetPromHTTPResponseSent(client *DelveClient, goroutineID int) map[string]string {
+	return printAndCollect(client, goroutineID,
+		"HTTP Response (message being sent, promhttp handler return) ───",
+		[]string{"req.Method", "req.URL.Path"})
+}
+
 func GetHTTPResponseRecvd(client *DelveClient, goroutineID int) map[string]string {
 	vprintln("\n┌─ HTTP Response (received) ───────────────────────────────────")
 	allVars := scanFrameVars(client, goroutineID, 0)

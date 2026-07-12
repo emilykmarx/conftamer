@@ -53,24 +53,24 @@ func (d *DelveClient) EvalVariable(goroutineID, frame int, expr string) (*api.Va
 	return d.c.EvalVariable(scope, expr, LoadCfg)
 }
 
-// SetBreakpointsFor resolves funcName to addresses and creates a breakpoint at each.
+// SetBreakpointsFor resolves bp.Location to addresses and creates a breakpoint at each.
 // Returns the set of breakpoint IDs created (nil if none found).
-func SetBreakpointsFor(client *DelveClient, funcName, name string) map[int]bool {
-	locs, err := client.FindLocation(funcName)
+func SetBreakpointsFor(client *DelveClient, bp Breakpoint) map[int]bool {
+	locs, err := client.FindLocation(bp.Location)
 	if err != nil || len(locs) == 0 {
-		vprintf("  WARNING: no locations found for %q — skipping\n", funcName)
+		vprintf("  WARNING: no locations found for %q — skipping\n", bp.Location)
 		return nil
 	}
 	ids := make(map[int]bool)
 	for _, loc := range locs {
-		bp, err := client.CreateBreakpoint(loc.PC)
+		created, err := client.CreateBreakpoint(loc.PC)
 		if err != nil {
-			vprintf("  WARNING: [%s] failed to create breakpoint at 0x%x: %v\n", name, loc.PC, err)
+			vprintf("  WARNING: [%s] failed to create breakpoint at 0x%x: %v\n", bp.Label, loc.PC, err)
 			continue
 		}
-		ids[bp.ID] = true
+		ids[created.ID] = true
 		vprintf("  [%s] Breakpoint %d at %s:%d (0x%x) for %q\n",
-			name, bp.ID, bp.File, bp.Line, loc.PC, funcName)
+			bp.Label, created.ID, created.File, created.Line, loc.PC, bp.Location)
 	}
 	return ids
 }
