@@ -24,30 +24,51 @@ type HTTPBreakpointIDs struct {
 	RespRecvBpIDs             map[int]bool
 }
 
-func SetHTTPBreakpoints(client *DelveClient) HTTPBreakpointIDs {
+// SetHTTPBreakpointsFor registers the "base" HTTP breakpoints (stdlib
+// net/http and its HTTP/2 support — present in any Go HTTP program) plus
+// whichever app-specific breakpoints (AppCaddy, AppPrometheus, ...) are
+// requested. Pass no apps to register only the base set.
+func SetHTTPBreakpointsFor(client *DelveClient, apps ...string) HTTPBreakpointIDs {
+	wanted := make(map[string]bool, len(apps))
+	for _, app := range apps {
+		wanted[app] = true
+	}
+
+	// set skips FindLocation entirely (rather than relying on
+	// SetBreakpointsFor's WARNING-and-skip) for breakpoints belonging to an
+	// app that wasn't requested, so tracing e.g. only Prometheus doesn't spend
+	// time or log noise probing for Caddy symbols that were never a target.
+	set := func(key string) map[int]bool {
+		bp := Breakpoints[key]
+		if bp.App != AppBase && !wanted[bp.App] {
+			return nil
+		}
+		return SetBreakpointsFor(client, bp)
+	}
+
 	// For HTTP/2, try both the external x/net/http2 package (Go <= 1.26) and
 	// the bundled h2_bundle.go version (Go >= 1.27). SetBreakpointsFor prints a
 	// WARNING and returns nil if a function is not found, so whichever copy is
 	// absent in this binary is silently skipped.
 	return HTTPBreakpointIDs{
-		ReqReceiveBpIDs: SetBreakpointsFor(client, Breakpoints["HTTPReceiveFunc"]),
+		ReqReceiveBpIDs: set("HTTPReceiveFunc"),
 		ReqReceiveH2BpIDs: mergeSets(
-			SetBreakpointsFor(client, Breakpoints["HTTPReceiveFuncH2"]),
-			SetBreakpointsFor(client, Breakpoints["HTTPReceiveFuncH2Bundled"]),
+			set("HTTPReceiveFuncH2"),
+			set("HTTPReceiveFuncH2Bundled"),
 		),
-		ReqReceiveCaddyBpIDs:      SetBreakpointsFor(client, Breakpoints["HTTPReceiveFuncCaddy"]),
-		ReqReceiveCaddyRouteBpIDs: SetBreakpointsFor(client, Breakpoints["HTTPReceiveFuncCaddyRoute"]),
-		ReqReceivePromHTTPBpIDs:   SetBreakpointsFor(client, Breakpoints["HTTPReceiveFuncPromHTTP"]),
-		ReqSendBpIDs:              SetBreakpointsFor(client, Breakpoints["HTTPSendFunc"]),
-		RespSendBpIDs:             SetBreakpointsFor(client, Breakpoints["HTTPResponseFunc"]),
+		ReqReceiveCaddyBpIDs:      set("HTTPReceiveFuncCaddy"),
+		ReqReceiveCaddyRouteBpIDs: set("HTTPReceiveFuncCaddyRoute"),
+		ReqReceivePromHTTPBpIDs:   set("HTTPReceiveFuncPromHTTP"),
+		ReqSendBpIDs:              set("HTTPSendFunc"),
+		RespSendBpIDs:             set("HTTPResponseFunc"),
 		RespSendH2BpIDs: mergeSets(
-			SetBreakpointsFor(client, Breakpoints["HTTPResponseFuncH2"]),
-			SetBreakpointsFor(client, Breakpoints["HTTPResponseFuncH2Bundled"]),
+			set("HTTPResponseFuncH2"),
+			set("HTTPResponseFuncH2Bundled"),
 		),
-		RespSendCaddyBpIDs:    SetBreakpointsFor(client, Breakpoints["HTTPResponseFuncCaddy"]),
-		RespSendRecorderBpIDs: SetBreakpointsFor(client, Breakpoints["HTTPResponseFuncRecorder"]),
-		RespSendPromHTTPBpIDs: SetBreakpointsFor(client, Breakpoints["HTTPResponseFuncPromHTTPReturn"]),
-		RespRecvBpIDs:         SetBreakpointsFor(client, Breakpoints["HTTPRecvResponseFunc"]),
+		RespSendCaddyBpIDs:    set("HTTPResponseFuncCaddy"),
+		RespSendRecorderBpIDs: set("HTTPResponseFuncRecorder"),
+		RespSendPromHTTPBpIDs: set("HTTPResponseFuncPromHTTPReturn"),
+		RespRecvBpIDs:         set("HTTPRecvResponseFunc"),
 	}
 }
 

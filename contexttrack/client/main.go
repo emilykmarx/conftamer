@@ -55,6 +55,7 @@ func main() {
 	addr := flag.String("addr", "localhost:2345", "Delve headless server address")
 	output := flag.String("output", "", "JSON Lines file to append events to (one object per line)")
 	verbose := flag.Bool("verbose", false, "print breakpoint and context details to the terminal")
+	apps := flag.String("apps", "caddy,prometheus", "comma-separated app-specific breakpoint sets to register in addition to the base HTTP ones (e.g. \"caddy\", \"prometheus\", \"caddy,prometheus\")")
 	flag.Parse()
 
 	contexttrack.Verbose = *verbose
@@ -72,10 +73,17 @@ func main() {
 		defer outFile.Close()
 	}
 
+	var appList []string
+	for _, app := range strings.Split(*apps, ",") {
+		if app = strings.TrimSpace(app); app != "" {
+			appList = append(appList, app)
+		}
+	}
+
 	if *verbose {
 		fmt.Println("Setting breakpoints:")
 	}
-	bpIDs := contexttrack.SetHTTPBreakpoints(client)
+	bpIDs := contexttrack.SetHTTPBreakpointsFor(client, appList...)
 	if *verbose {
 		fmt.Println("Waiting for HTTP events… (Ctrl-C to stop)\n")
 	}

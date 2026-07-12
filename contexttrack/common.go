@@ -7,24 +7,38 @@ import (
 	"github.com/go-delve/delve/service/api"
 )
 
-// Breakpoint describes one Delve breakpoint target: the location to resolve
-// (a function name, or a "file:line" for the one case where no function
-// boundary works) and the label used in diagnostic output and log lines.
+// App tags for Breakpoint.App. "base" breakpoints hook stdlib net/http (and
+// its HTTP/2 support) — the machinery present in any Go HTTP program, so
+// they're always registered regardless of which target is being traced. The
+// others hook code specific to one traced application, and are only
+// registered when that app is requested.
+const (
+	AppBase       = "base"
+	AppCaddy      = "caddy"
+	AppPrometheus = "prometheus"
+)
+
+// Breakpoint describes one Delve breakpoint target.
 type Breakpoint struct {
-	Location string
-	Label    string
+	Location string // function name, or "file:line" for the one case where no function boundary works
+	Label    string // used in diagnostic output and log lines
+	Package  string // import path Location resolves against — what a version bump of this dependency could shift
+	App      string // AppBase, AppCaddy, or AppPrometheus — which traced application this is specific to
 }
 
 // Breakpoints maps a stable key to each HTTP hook point Delve instruments.
-// SetHTTPBreakpoints (context_finder.go) loads this map directly, so adding a
-// new hook point only requires adding an entry here — no new top-level
-// variable, and no separate label to keep in sync at the call site.
+// SetHTTPBreakpointsFor (context_finder.go) loads this map directly, so
+// adding a new hook point only requires adding an entry here — no new
+// top-level variable, and no separate label/app to keep in sync at the call
+// site.
 var Breakpoints = map[string]Breakpoint{
 	// Inbound request received (HTTP/1.x). Fires once per request before any
 	// registered handlers. Takes *http.Request as an argument named `req`.
 	"HTTPReceiveFunc": {
 		Location: "net/http.(*ServeMux).ServeHTTP",
 		Label:    "req-received",
+		Package:  "net/http",
+		App:      AppBase,
 	},
 
 	// Inbound request received by Caddy's HTTP server. Fires for all requests
@@ -33,6 +47,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPReceiveFuncCaddy": {
 		Location: "github.com/caddyserver/caddy/v2/modules/caddyhttp.(*Server).ServeHTTP",
 		Label:    "req-received-caddy",
+		Package:  "github.com/caddyserver/caddy/v2/modules/caddyhttp",
+		App:      AppCaddy,
 	},
 
 	// Inbound request received at the compiled-route boundary, one layer inside
@@ -43,6 +59,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPReceiveFuncCaddyRoute": {
 		Location: "github.com/caddyserver/caddy/v2/modules/caddyhttp.(*metricsInstrumentedRoute).ServeHTTP",
 		Label:    "req-received-caddy-route",
+		Package:  "github.com/caddyserver/caddy/v2/modules/caddyhttp",
+		App:      AppCaddy,
 	},
 
 	// Inbound request received (HTTP/2, Go >= 1.27 bundled h2_bundle.go).
@@ -50,6 +68,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPReceiveFuncH2Bundled": {
 		Location: "net/http.(*http2serverConn).runHandler",
 		Label:    "req-received-h2-bundled",
+		Package:  "net/http",
+		App:      AppBase,
 	},
 
 	// Inbound request received (HTTP/2, Go <= 1.26 external golang.org/x/net/http2).
@@ -58,12 +78,16 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPReceiveFuncH2": {
 		Location: "golang.org/x/net/http2.(*serverConn).runHandler",
 		Label:    "req-received-h2",
+		Package:  "golang.org/x/net/http2",
+		App:      AppBase,
 	},
 
 	// Outbound request sent. Performs the actual TCP write. Takes *http.Request.
 	"HTTPSendFunc": {
 		Location: "net/http.(*Transport).roundTrip",
 		Label:    "req-sent",
+		Package:  "net/http",
+		App:      AppBase,
 	},
 
 	// Outbound response sent (HTTP/1.x). Server writes HTTP header by committing
@@ -71,6 +95,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPResponseFunc": {
 		Location: "net/http.(*response).WriteHeader",
 		Label:    "resp-sent",
+		Package:  "net/http",
+		App:      AppBase,
 	},
 
 	// Outbound response sent (HTTP/2, Go >= 1.27 bundled h2_bundle.go).
@@ -78,6 +104,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPResponseFuncH2Bundled": {
 		Location: "net/http.(*http2responseWriter).WriteHeader",
 		Label:    "resp-sent-h2-bundled",
+		Package:  "net/http",
+		App:      AppBase,
 	},
 
 	// Outbound response sent (HTTP/2, Go <= 1.26 external golang.org/x/net/http2).
@@ -85,6 +113,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPResponseFuncH2": {
 		Location: "golang.org/x/net/http2.(*responseWriter).WriteHeader",
 		Label:    "resp-sent-h2",
+		Package:  "golang.org/x/net/http2",
+		App:      AppBase,
 	},
 
 	// Outbound response committed at the Caddy layer, one level above whatever
@@ -96,6 +126,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPResponseFuncCaddy": {
 		Location: "github.com/caddyserver/caddy/v2/modules/caddyhttp.(*responseRecorder).WriteHeader",
 		Label:    "resp-sent-caddy",
+		Package:  "github.com/caddyserver/caddy/v2/modules/caddyhttp",
+		App:      AppCaddy,
 	},
 
 	// Inbound response received. Hooks net/http.redirectBehavior, called inside
@@ -104,6 +136,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPRecvResponseFunc": {
 		Location: "net/http.redirectBehavior",
 		Label:    "resp-received",
+		Package:  "net/http",
+		App:      AppBase,
 	},
 
 	// Inbound request received by promhttp's metric-serving handler (the closure
@@ -114,6 +148,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPReceiveFuncPromHTTP": {
 		Location: "github.com/prometheus/client_golang/prometheus/promhttp.HandlerForTransactional.func1",
 		Label:    "req-received-promhttp",
+		Package:  "github.com/prometheus/client_golang/prometheus/promhttp",
+		App:      AppPrometheus,
 	},
 
 	// Outbound response committed via httptest.ResponseRecorder, the fake
@@ -138,9 +174,15 @@ var Breakpoints = map[string]Breakpoint{
 	// from HandlerForTransactional.func1 without going through the encoder, so
 	// they resolve fine. See HTTPResponseFuncPromHTTPReturn for the success-path
 	// fallback.
+	//
+	// Package is stdlib (net/http/httptest), not client_golang — a promhttp
+	// version bump can't shift this one — but App is AppPrometheus because
+	// this codebase only expects it to fire while tracing promhttp's tests.
 	"HTTPResponseFuncRecorder": {
 		Location: "net/http/httptest.(*ResponseRecorder).WriteHeader",
 		Label:    "resp-sent-recorder",
+		Package:  "net/http/httptest",
+		App:      AppPrometheus,
 	},
 
 	// Fallback "response sent" hook for promhttp's success path, where
@@ -161,6 +203,8 @@ var Breakpoints = map[string]Breakpoint{
 	"HTTPResponseFuncPromHTTPReturn": {
 		Location: "promhttp/http.go:259",
 		Label:    "resp-sent-promhttp-return",
+		Package:  "github.com/prometheus/client_golang/prometheus/promhttp",
+		App:      AppPrometheus,
 	},
 }
 
