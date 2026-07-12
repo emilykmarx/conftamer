@@ -98,6 +98,10 @@ Integration tests (note: disable timeout):
 dlv test --headless --listen=:2345 --api-version=2 --build-flags="-gcflags=net/http=-l" ./caddytest/integration/ -- -test.v -test.timeout 0
 ```
 
+### Prometheus
+
+Need to increase timeouts. For example: `scrape/manager_test.go` has `scrape_timeouts` that default to `5s`.
+
 ## TODOS
 
 - Some measure of coverage?
