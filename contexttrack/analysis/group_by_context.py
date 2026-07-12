@@ -45,9 +45,11 @@ def _ident(event: dict) -> tuple:
         code = ""
 
     elif kind == "Response sent":
-        # HTTP/1.x stores at w.req.*; HTTP/2 stores at w.rws.req.*
-        verb = msg.get("w.req.Method") or msg.get("w.rws.req.Method", "?")
-        path = msg.get("w.req.URL.Path") or msg.get("w.rws.req.URL.Path", "/")
+        # HTTP/1.x stores at w.req.*; HTTP/2 stores at w.rws.req.*; the
+        # promhttp handler-return fallback (no response-writer field to key
+        # off) stores directly at req.*.
+        verb = msg.get("w.req.Method") or msg.get("w.rws.req.Method") or msg.get("req.Method", "?")
+        path = msg.get("w.req.URL.Path") or msg.get("w.rws.req.URL.Path") or msg.get("req.URL.Path", "/")
         code = msg.get("code", "?")
 
     elif kind == "Response received":
