@@ -102,6 +102,13 @@ dlv test --headless --listen=:2345 --api-version=2 --build-flags="-gcflags=net/h
 
 Need to increase timeouts. For example: `scrape/manager_test.go` has `scrape_timeouts` that default to `5s`.
 
+### Kubernetes
+
+Also need to increase timeouts.
+
+- staging/src/k8s.io/component-helpers/apimachinery/lease/controller.go: increase shutdownTimeout
+- staging/src/k8s.io/client-go/transport/cache.go: increase TLSHandshakeTimeout
+
 ## TODOS
 
 - Some measure of coverage?
