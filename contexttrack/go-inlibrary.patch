@@ -1,0 +1,514 @@
+diff --git a/home/tcr6/go-conftamer/src/context/conftamer.go b/home/tcr6/go-conftamer/src/context/conftamer.go
+new file mode 100644
+index 0000000..8103c44
+--- /dev/null
++++ b/home/tcr6/go-conftamer/src/context/conftamer.go
+@@ -0,0 +1,68 @@
++// ConfTamer instrumentation: in-process reimplementation of the context
++// parent-chain walk that contexttrack/ previously performed over Delve's RPC
++// (see contexttrack/context_finder.go: walkContextChain / parentPointers).
++//
++// Living inside package context gives direct access to the unexported parent
++// fields of the concrete context types, so the walk needs no reflection or
++// debugger. The net/http-scope stop rule is supplied by the caller as a
++// predicate over a valueCtx's key, so context needs no dependency on net/http.
++
++package context
++
++import "unsafe"
++
++// ConftamerRoot walks the parent chain starting from ctx, following the three
++// concrete context types the tracer understands — *valueCtx, *cancelCtx and
++// *timerCtx — and returns the address of the root (topmost reached) context as
++// a uintptr, or 0 if ctx is nil. The address is an opaque, process-stable join
++// key: two events whose contexts walk to the same root are correlated.
++//
++// The walk stops (without crossing) before a *valueCtx whose key satisfies
++// stop. net/http passes a stop that matches its own connection/server-scoped
++// keys (ServerContextKey, LocalAddrContextKey); crossing those would wrongly
++// unify every request on a connection — or the whole server — under one root.
++// The walk also stops at any context type it can't traverse (Background/TODO,
++// WithoutCancel, or a caller's custom wrapper), capped at 15 levels. These stop
++// conditions mirror contexttrack's original behavior exactly.
++func ConftamerRoot(ctx Context, stop func(key any) bool) uintptr {
++	if ctx == nil {
++		return 0
++	}
++	cur := ctx
++	curAddr := ctxAddr(cur)
++	for range 15 {
++		var parent Context
++		switch c := cur.(type) {
++		case *valueCtx:
++			parent = c.Context
++		case *cancelCtx:
++			parent = c.Context
++		case *timerCtx:
++			parent = c.cancelCtx.Context
++		default:
++			// Unknown / uncrossable context type — this is the root.
++			return curAddr
++		}
++		if parent == nil {
++			return curAddr
++		}
++		// If the parent is a net/http-scoped valueCtx, stop without crossing.
++		if vc, ok := parent.(*valueCtx); ok && stop != nil && stop(vc.key) {
++			return curAddr
++		}
++		cur = parent
++		curAddr = ctxAddr(cur)
++	}
++	return curAddr
++}
++
++// ctxAddr returns the address of the concrete value stored in the interface c.
++// For the pointer-typed contexts the walk crosses, this is the struct pointer
++// (matching the address Delve reported as root_addr). For a zero-size value
++// context (e.g. Background()), it is the shared zerobase address — the same
++// over-merging behavior the original Delve walk exhibited.
++func ctxAddr(c Context) uintptr {
++	// An interface value is a (type, data) word pair; the second word holds
++	// the pointer to (or the pointer-shaped value of) the concrete data.
++	return uintptr((*[2]unsafe.Pointer)(unsafe.Pointer(&c))[1])
++}
+diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/net/http/client.go
+index d6a8010..c7acb37 100644
+--- a/usr/local/go/src/net/http/client.go
++++ b/home/tcr6/go-conftamer/src/net/http/client.go
+@@ -21,6 +21,7 @@ import (
+ 	"net/url"
+ 	"reflect"
+ 	"slices"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -607,6 +608,15 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+ 	}
+ 	_ = *c // panic early if c is nil; see go.dev/issue/53521
+ 
++	// ConfTamer: stamp/inherit a request ID at the client origin so the
++	// outbound Request-sent (roundTrip) and its Response-received (below) share
++	// a join key, and so a call inherited from a server handler's context links
++	// the outbound request to the inbound one. Uses the returned copy so the
++	// caller's *Request is not mutated.
++	if conftamerOn() {
++		req = req.WithContext(conftamerStampID(req.Context()))
++	}
++
+ 	var (
+ 		deadline      = c.deadline()
+ 		reqs          []*Request
+@@ -739,6 +749,14 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+ 			return nil, uerr(err)
+ 		}
+ 
++		ireq := reqs[0]
++		conftamerLog("Response received", map[string]string{
++			"resp.StatusCode": strconv.Itoa(resp.StatusCode),
++			"resp.Status":     resp.Status,
++			"ireq.Method":     ireq.Method,
++			"ireq.URL.Path":   ireq.URL.Path,
++		}, ireq.Context(), nil, false)
++
+ 		var shouldRedirect, includeBodyOnHop bool
+ 		redirectMethod, shouldRedirect, includeBodyOnHop = redirectBehavior(req.Method, resp, reqs[0])
+ 		if !shouldRedirect {
+diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-conftamer/src/net/http/conftamer.go
+new file mode 100644
+index 0000000..36859b7
+--- /dev/null
++++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
+@@ -0,0 +1,300 @@
++// ConfTamer instrumentation embedded in net/http.
++//
++// This reproduces, in-process, what contexttrack/ previously did with a Delve
++// debugger: at a handful of HTTP funnel points it records the message, resolves
++// the request context's root address (the correlation join key), and — for
++// outbound events — identifies the application-level caller. One JSON object is
++// appended to the file named by $CONFTAMER_EVENTS per event, in the exact
++// schema the contexttrack/analysis/ scripts consume. If $CONFTAMER_EVENTS is
++// unset, every hook is a cheap no-op.
++//
++// Ported from contexttrack/client/main.go (event schema), context_finder.go
++// (ContextInfo, the parent-chain walk — now context.ConftamerRoot) and
++// caller_id.go (FindCaller / packageName / apiIdForPackage).
++
++package http
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"runtime"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++)
++
++// --- output sink -----------------------------------------------------------
++
++var (
++	conftamerOnce    sync.Once
++	conftamerMu      sync.Mutex
++	conftamerFile    *os.File
++	conftamerEnabled bool
++)
++
++func conftamerInit() {
++	path := os.Getenv("CONFTAMER_EVENTS")
++	if path == "" {
++		return
++	}
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
++	if err != nil {
++		return
++	}
++	conftamerFile = f
++	conftamerEnabled = true
++	conftamerJoinAddr = os.Getenv("CONFTAMER_JOIN") == "addr"
++}
++
++func conftamerOn() bool {
++	conftamerOnce.Do(conftamerInit)
++	return conftamerEnabled
++}
++
++// --- event schema (mirrors contexttrack/client/main.go) --------------------
++
++type conftamerEvent struct {
++	Kind        string                `json:"kind"`
++	GoroutineID int                   `json:"goroutine_id"`
++	ThreadID    int                   `json:"thread_id"`
++	File        string                `json:"file"`
++	Line        int                   `json:"line"`
++	Message     map[string]string     `json:"message"`
++	Context     *conftamerContextInfo `json:"context"`
++	RequestID   *conftamerRequestID   `json:"request_id,omitempty"`
++	ApiId       string                `json:"api_id,omitempty"`
++	Pattern     string                `json:"pattern,omitempty"`
++}
++
++type conftamerRequestID struct {
++	Method string `json:"method"`
++	Host   string `json:"host"`
++	Path   string `json:"path"`
++}
++
++type conftamerContextInfo struct {
++	Source   string `json:"source,omitempty"`
++	Type     string `json:"type,omitempty"`
++	RootAddr string `json:"root_addr,omitempty"`
++	Error    string `json:"error,omitempty"`
++}
++
++// --- correlation join key --------------------------------------------------
++//
++// Default ("id" mode): an explicit, process-local, monotonically-increasing
++// request ID stamped into the request context at its origin (server ingress or
++// client Client.do) and inherited by every derived context. The join key for an
++// event is that ID, found by context.Value walking up the chain. This is
++// unique-per-origin (no scrape over-merge), traverses every context type (no
++// under-merge at WithoutCancel/custom wrappers), and never aliases (no
++// address-reuse false merge) — the three failure modes of the address walk.
++//
++// "addr" mode (CONFTAMER_JOIN=addr): the original Delve-faithful heap-address
++// walk (context.ConftamerRoot), kept for A/B regression comparison.
++
++// conftamerIDKey is the context.Value key for the stamped request ID. Its
++// unexported type makes it collision-proof.
++type conftamerIDKeyType struct{}
++
++var (
++	conftamerIDKey    conftamerIDKeyType
++	conftamerNextID   atomic.Uint64
++	conftamerJoinAddr bool // set from CONFTAMER_JOIN=addr in conftamerInit
++)
++
++// conftamerStampID returns ctx unchanged if it already carries an ID
++// (inherited from an ancestor), else a child context carrying a fresh
++// monotonic ID.
++func conftamerStampID(ctx context.Context) context.Context {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if _, ok := ctx.Value(conftamerIDKey).(uint64); ok {
++		return ctx
++	}
++	return context.WithValue(ctx, conftamerIDKey, conftamerNextID.Add(1))
++}
++
++// conftamerStampIDIfOn is conftamerStampID gated on the logger being enabled,
++// so the ingress stamping edits stay a single expression and add zero overhead
++// when CONFTAMER_EVENTS is unset.
++func conftamerStampIDIfOn(ctx context.Context) context.Context {
++	if !conftamerOn() {
++		return ctx
++	}
++	return conftamerStampID(ctx)
++}
++
++// conftamerScopeStop reports whether a valueCtx key is one of net/http's own
++// connection/server-scoped keys (ServerContextKey, LocalAddrContextKey), which
++// use the unexported *contextKey type. The address walk must not cross these.
++func conftamerScopeStop(k any) bool {
++	_, ok := k.(*contextKey)
++	return ok
++}
++
++func conftamerContext(ctx context.Context) *conftamerContextInfo {
++	if ctx == nil {
++		return &conftamerContextInfo{Error: "nil context"}
++	}
++	root := "?"
++	if conftamerJoinAddr {
++		if a := context.ConftamerRoot(ctx, conftamerScopeStop); a != 0 {
++			root = "0x" + strconv.FormatUint(uint64(a), 16)
++		}
++	} else {
++		// id mode: inherited ID if present, else a fresh one (a direct
++		// Transport.RoundTrip origin with an un-tagged context — it has no
++		// Response-received event to match, so a fresh ID is correct).
++		id, ok := ctx.Value(conftamerIDKey).(uint64)
++		if !ok {
++			id = conftamerNextID.Add(1)
++		}
++		root = "id:" + strconv.FormatUint(id, 10)
++	}
++	return &conftamerContextInfo{
++		Source:   "req.Context()",
++		Type:     "context.Context",
++		RootAddr: root,
++	}
++}
++
++// --- caller identification (ported from caller_id.go) ----------------------
++
++var conftamerHTTPLayerPackages = map[string]bool{
++	"net/http":               true,
++	"golang.org/x/net/http2": true,
++}
++
++var conftamerMultiTenantHosts = map[string]bool{
++	"github.com":    true,
++	"gitlab.com":    true,
++	"bitbucket.org": true,
++}
++
++type conftamerCaller struct {
++	FuncName string
++	Package  string
++	ApiId    string
++}
++
++// conftamerPackageName extracts the import path from a runtime fully-qualified
++// function name, e.g. "github.com/prometheus/prometheus/scrape.(*x).scrape" ->
++// "github.com/prometheus/prometheus/scrape". Import paths may contain dots, so
++// the boundary is: drop any "[...]" generic suffix, find the last "/", then the
++// first "." after it.
++func conftamerPackageName(fullName string) string {
++	name := fullName
++	if start := strings.Index(name, "["); start >= 0 {
++		name = name[:start]
++	}
++	pathEnd := strings.LastIndex(name, "/")
++	if pathEnd < 0 {
++		pathEnd = 0
++	}
++	if dot := strings.Index(name[pathEnd:], "."); dot >= 0 {
++		return name[:pathEnd+dot]
++	}
++	return ""
++}
++
++// conftamerApiID derives an organization id from a package import path, e.g.
++// "github.com/prometheus/prometheus/scrape" -> "github.com/prometheus",
++// "k8s.io/client-go/rest" -> "k8s.io". Stdlib paths (no dot in the first
++// segment) are returned unchanged.
++func conftamerApiID(pkg string) string {
++	if pkg == "" {
++		return ""
++	}
++	segs := strings.SplitN(pkg, "/", 3)
++	if !strings.Contains(segs[0], ".") {
++		return pkg
++	}
++	if len(segs) >= 2 && conftamerMultiTenantHosts[segs[0]] {
++		return segs[0] + "/" + segs[1]
++	}
++	return segs[0]
++}
++
++// conftamerFindCaller walks the current goroutine's stack and returns the first
++// frame whose package is not an HTTP-layer package. The net/http hook site and
++// these helper frames are themselves in net/http, so they're skipped naturally.
++func conftamerFindCaller() *conftamerCaller {
++	var pcs [50]uintptr
++	n := runtime.Callers(2, pcs[:])
++	if n == 0 {
++		return nil
++	}
++	frames := runtime.CallersFrames(pcs[:n])
++	for {
++		f, more := frames.Next()
++		pkg := conftamerPackageName(f.Function)
++		if pkg != "" && !conftamerHTTPLayerPackages[pkg] {
++			return &conftamerCaller{FuncName: f.Function, Package: pkg, ApiId: conftamerApiID(pkg)}
++		}
++		if !more {
++			break
++		}
++	}
++	return nil
++}
++
++// --- metadata --------------------------------------------------------------
++
++func conftamerGoID() int {
++	var buf [64]byte
++	n := runtime.Stack(buf[:], false)
++	s := string(buf[:n])
++	s = strings.TrimPrefix(s, "goroutine ")
++	if i := strings.IndexByte(s, ' '); i >= 0 {
++		id, _ := strconv.Atoi(s[:i])
++		return id
++	}
++	return 0
++}
++
++// --- the logging entry point -----------------------------------------------
++
++// conftamerLog records one HTTP event. kind is one of "Request received",
++// "Request sent", "Response sent", "Response received". msg holds the extracted
++// message fields (keys match contexttrack/fmt.go). ctx is the request context
++// used for correlation. reqID (may be nil) is set for "Request sent"; withCaller
++// enables caller identification for the "sent" kinds.
++func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool) {
++	if !conftamerOn() {
++		return
++	}
++
++	_, file, line, _ := runtime.Caller(1)
++
++	ev := conftamerEvent{
++		Kind:        kind,
++		GoroutineID: conftamerGoID(),
++		File:        file,
++		Line:        line,
++		Message:     msg,
++		Context:     conftamerContext(ctx),
++	}
++
++	if withCaller {
++		if c := conftamerFindCaller(); c != nil {
++			ev.ApiId = c.ApiId
++			if kind == "Response sent" {
++				ev.Pattern = c.FuncName
++			}
++		}
++	}
++	if kind == "Request sent" {
++		ev.RequestID = reqID
++	}
++
++	linebytes, err := json.Marshal(ev)
++	if err != nil {
++		return
++	}
++	conftamerMu.Lock()
++	conftamerFile.Write(append(linebytes, '\n'))
++	conftamerMu.Unlock()
++}
+diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
+index c440e76..f7e385e 100644
+--- a/usr/local/go/src/net/http/h2_bundle.go
++++ b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
+@@ -6314,6 +6314,7 @@ func (sc *http2serverConn) newWriterAndRequestNoBody(st *http2stream, rp httpcom
+ 		Body:       body,
+ 		Trailer:    res.Trailer,
+ 	}).WithContext(st.ctx)
++	req.ctx = conftamerStampIDIfOn(req.Context())
+ 	rw := sc.newResponseWriter(st, req)
+ 	return rw, req, nil
+ }
+@@ -6385,6 +6386,11 @@ func (sc *http2serverConn) handlerDone() {
+ 
+ // Run on its own goroutine.
+ func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *Request, handler func(ResponseWriter, *Request)) {
++	conftamerLog("Request received", map[string]string{
++		"req.Method":       req.Method,
++		"req.URL.Path":     req.URL.Path,
++		"req.URL.RawQuery": req.URL.RawQuery,
++	}, req.Context(), nil, false)
+ 	defer sc.sendServeMsg(http2handlerDoneMsg)
+ 	didPanic := true
+ 	defer func() {
+@@ -6940,6 +6946,11 @@ func (w *http2responseWriter) WriteHeader(code int) {
+ 	if rws == nil {
+ 		panic("WriteHeader called after Handler finished")
+ 	}
++	conftamerLog("Response sent", map[string]string{
++		"code":               strconv.Itoa(code),
++		"w.rws.req.Method":   rws.req.Method,
++		"w.rws.req.URL.Path": rws.req.URL.Path,
++	}, rws.req.Context(), nil, true)
+ 	rws.writeHeader(code)
+ }
+ 
+diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/net/http/server.go
+index d63d5bf..63f8b26 100644
+--- a/usr/local/go/src/net/http/server.go
++++ b/home/tcr6/go-conftamer/src/net/http/server.go
+@@ -1038,7 +1038,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
+ 	delete(req.Header, "Host")
+ 
+ 	ctx, cancelCtx := context.WithCancel(ctx)
+-	req.ctx = ctx
++	req.ctx = conftamerStampIDIfOn(ctx)
+ 	req.RemoteAddr = c.remoteAddr
+ 	req.TLS = c.tlsState
+ 	if body, ok := req.Body.(*body); ok {
+@@ -1159,6 +1159,12 @@ func (w *response) WriteHeader(code int) {
+ 	}
+ 	checkWriteHeaderCode(code)
+ 
++	conftamerLog("Response sent", map[string]string{
++		"code":           strconv.Itoa(code),
++		"w.req.Method":   w.req.Method,
++		"w.req.URL.Path": w.req.URL.Path,
++	}, w.req.Context(), nil, true)
++
+ 	if code < 101 || code > 199 {
+ 		// Sending a 100 Continue or any non-1xx header disables the
+ 		// automatically-sent 100 Continue from Request.Body.Read.
+@@ -3300,6 +3306,11 @@ type serverHandler struct {
+ //
+ //go:linkname badServeHTTP net/http.serverHandler.ServeHTTP
+ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
++	conftamerLog("Request received", map[string]string{
++		"req.Method":       req.Method,
++		"req.URL.Path":     req.URL.Path,
++		"req.URL.RawQuery": req.URL.RawQuery,
++	}, req.Context(), nil, false)
+ 	handler := sh.srv.Handler
+ 	if handler == nil {
+ 		handler = DefaultServeMux
+diff --git a/usr/local/go/src/net/http/transport.go b/home/tcr6/go-conftamer/src/net/http/transport.go
+index 26a25d2..5b857cd 100644
+--- a/usr/local/go/src/net/http/transport.go
++++ b/home/tcr6/go-conftamer/src/net/http/transport.go
+@@ -596,6 +596,12 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
+ 		req.closeBody()
+ 		return nil, errors.New("http: nil Request.URL")
+ 	}
++	conftamerLog("Request sent", map[string]string{
++		"req.Method":       req.Method,
++		"req.URL.Host":     req.URL.Host,
++		"req.URL.Path":     req.URL.Path,
++		"req.URL.RawQuery": req.URL.RawQuery,
++	}, ctx, &conftamerRequestID{Method: req.Method, Host: req.URL.Host, Path: req.URL.Path}, true)
+ 	if req.Header == nil {
+ 		req.closeBody()
+ 		return nil, errors.New("http: nil Request.Header")
