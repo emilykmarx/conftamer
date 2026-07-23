@@ -71,15 +71,80 @@ Note: use `-count=1` to ensure that packages with cached results get re-executed
 `./scrape/` (scrape client + response handling) and `./web/` (API server) are the
 most productive packages to point this at.
 
+## Running Caddy tests
+
+All integration tests:
+
+```bash
+cd ~/caddy
+EV=~/conftamer/contexttrack/events/caddy_test.jsonl
+rm -f "$EV"
+
+GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
+  ~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/
+```
+
+Note: use `-p 1` to disable parallelization.
+Each integration test starts a Caddy server on the same port, so we can't
+actually execute parallel test processes.
+
+Or, just one test, e.g.:
+
+```bash
+GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
+  ~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/ \
+  -run TestReverseProxySubroutes
+```
+
+Unit tests:
+
+```bash
+GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
+  ~/go-conftamer/bin/go test -count=1 ./modules/caddyhttp/reverseproxy/
+```
+
+## Running Kubernetes tests
+
+Note: `etcd` must be on `PATH` — the integration test framework calls
+`exec.LookPath("etcd")` and fails hard otherwise. If missing:
+
+```bash
+cd ~/kubernetes && hack/install-etcd.sh
+export PATH="$PATH:$HOME/kubernetes/third_party/etcd"
+```
+
+All tests in the endpoints integration package:
+
+```bash
+cd ~/kubernetes
+EV=~/conftamer/contexttrack/events/k8s_test.jsonl
+rm -f "$EV"
+
+GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
+  ~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/
+```
+
+Or, just one test, e.g.:
+
+```bash
+GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
+  ~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/ \
+  -run TestEndpointWithMultiplePods
+```
+
+`./test/integration/endpoints` (apiserver + etcd) is the primary package.
+
+TODO: other packages under `./test/integration/` might have other prereqs.
+
 ## Analyzing the output
 
 Same scripts as the Delve workflow — run them from the repo root:
 
 ```bash
 cd /home/tcr6/conftamer
-EV=contexttrack/events/prom.jsonl
+EV=contexttrack/events/caddy_test.jsonl   # or k8s_test.jsonl, prom.jsonl, ...
 
-# Text summary: messages grouped by shared context (the potential graph edges)
+# Text summary
 python3 contexttrack/analysis/group_by_context.py "$EV"
 
 # Graph
@@ -93,20 +158,16 @@ causality). See [`message_graph`](analysis/message_graph.py) for node/edge detai
 
 ## Notes & gotchas
 
-- **`GOTOOLCHAIN=local` on every invocation** — the single most common failure mode
-  (an empty `prom.jsonl`) is forgetting it.
-- **Stale server on `:9090`** — same gotcha as the Delve workflow. A pre-existing
-  Prometheus may already own `:9090`; the instrumented one then fails to bind and
-  exits, and a readiness `curl` silently hits the *stale, uninstrumented* server,
-  leaving `prom.jsonl` empty. Check with `ss -tlnp | grep 9090`, and use a free port
-  (e.g. `:19090`) rather than killing a server you didn't start.
+- **`GOTOOLCHAIN=local` on every invocation** — results in empty events file
+- **Stale server** (Prometheus, Caddy) — Check with `ss -tlnp | grep 9090` (Prometheus)
+  or `2999` (Caddy) and kill the stale PID.
+- **`-p 1` for Caddy integration tests** — to avoid port collisions
+- **`etcd` on `PATH`** (Kubernetes) — `framework.EtcdMain` calls
+  `exec.LookPath("etcd")` before any test runs.
+- **504 orphan events** (Kubernetes) — the
+  `WithTimeoutForNonLongRunningRequests` filter in apiserver races the request
+  handler against a wall-clock deadline. If you see a `resp sent ... 504` with no matching `req received`, up `RequestTimeout` in
+  `staging/src/k8s.io/apiserver/pkg/server/config.go`.
 - **Append-only output** — `rm` the file between isolated runs.
-- **`/usr/local/go` is untouched** — normal Go work is unaffected; only commands
-  that explicitly use `/home/tcr6/go-conftamer/bin/go` get the instrumented library.
-- **Scope:** HTTP/1.x and bundled HTTP/2 are instrumented. External
-  `golang.org/x/net/http2` (module cache) is not reachable via the clone; Prometheus's
-  standard client/server paths don't need it.
-- **Join-key comparison:** to compare a new run against a pre-existing Delve-era
-  `events.jsonl`, regenerate with `CONFTAMER_JOIN=addr` so both use heap addresses;
-  the default `id:N` keys are intentionally not address-comparable.
-- Per `CLAUDE.md`: graph edges mean "shares a tracked context," not "causes."
+- **Libraries:** HTTP/1.x and bundled HTTP/2 are instrumented.
+  If a test uses a mocked library, it won't work.

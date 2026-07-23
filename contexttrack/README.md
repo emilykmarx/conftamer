@@ -108,6 +108,7 @@ Also need to increase timeouts.
 
 - staging/src/k8s.io/component-helpers/apimachinery/lease/controller.go: increase shutdownTimeout
 - staging/src/k8s.io/client-go/transport/cache.go: increase TLSHandshakeTimeout
+- staging/src/k8s.io/apiserver/pkg/server/config.go: increase RequestTimeout
 
 ## TODOS
 
