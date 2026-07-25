@@ -95,7 +95,8 @@ func (m *AllTaint) DumpHierarchy(filename string) error {
 	for api_call_id, msg_info := range *m {
 		for _, keys := range msg_info.controlFlow {
 			for _, key := range keys {
-				api_call_str := fmt.Sprintf("%v-%v/%v", api_call_id.API, api_call_id.Verb, api_call_id.Resource)
+				// assume resource already has a / prefix
+				api_call_str := fmt.Sprintf("%v-%v%v", api_call_id.API, api_call_id.Verb, api_call_id.Resource)
 				InsertToParamHierarchy(param_hierarchy, strings.Split(key, "."), api_call_str)
 			}
 		}
@@ -150,4 +151,16 @@ func (m *AllTaint) AddCTypeMethodCall(api_call_id apimessages.APICallID, param_k
 	existing_flow.controlFlow[recvr_type] = param_keys
 
 	(*m)[api_call_id] = existing_flow
+}
+
+func CombineTaints(list []AllTaint) AllTaint {
+	all := make(AllTaint)
+	for _, one := range list {
+		for api_call_id, msg_info := range one {
+			for recvr_type, keys := range msg_info.controlFlow {
+				all.AddCTypeMethodCall(api_call_id, keys, recvr_type)
+			}
+		}
+	}
+	return all
 }
