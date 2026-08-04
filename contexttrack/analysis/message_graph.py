@@ -11,6 +11,7 @@ Run to svg: python3 contexttrack/analysis/message_graph.py --format dot | dot -T
 
 import argparse
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -18,15 +19,50 @@ from event_io import load_events
 
 
 _PREFIXES = re.compile(r"^(req|ireq|r)\.")
-_EXCLUDE_SUFFIXES = {"URL.RawQuery"}
+_ALWAYS_EXCLUDE_SUFFIXES = {"URL.RawQuery"}
+_EXCLUDE_SUFFIXES = set(_ALWAYS_EXCLUDE_SUFFIXES)
 
 
 def _normalize_key(k: str) -> str:
     return _PREFIXES.sub("req.", k)
 
 
+def _new_key(ev: dict) -> tuple | None:
+    """API-level node key for events carrying api_id (from the Go tracer's
+    caller-identification: the org that owns the code invoking the HTTP
+    library, found by backtracing past protocol-agnostic HTTP-layer frames).
+    "Request sent" events key off (kind, api_id, method, path); "Response
+    sent" events key off (kind, api_id, pattern) where pattern is the
+    fully-qualified name of the handler frame that produced the response.
+    request_id.host is deliberately excluded from the key — it's frequently
+    an ephemeral test-server port that would fragment otherwise-identical
+    nodes across runs.
+
+    Returns None if this event doesn't carry the new fields, so the caller
+    falls back to the legacy _msg_key() logic (older trace files, or
+    "Request received"/"Response received" kinds, which this key doesn't
+    cover).
+    """
+    kind = ev.get("kind", "")
+    api_id = ev.get("api_id")
+    if not api_id:
+        return None
+    if kind == "Request sent":
+        rid = ev.get("request_id") or {}
+        if rid.get("method") and rid.get("path"):
+            return (kind, api_id, rid["method"], rid["path"])
+    elif kind == "Response sent":
+        pattern = ev.get("pattern")
+        if pattern:
+            return (kind, api_id, pattern)
+    return None
+
+
 def _msg_key(ev: dict) -> tuple:
-    """Return a hashable, order-stable key for the message dict."""
+    """Return a hashable, order-stable key identifying this event's graph node."""
+    new_key = _new_key(ev)
+    if new_key is not None:
+        return new_key
     msg = ev.get("message", {})
     pairs = {}
     for k, v in msg.items():
@@ -38,10 +74,47 @@ def _msg_key(ev: dict) -> tuple:
     return tuple(sorted(pairs.items()))
 
 
-def _msg_label(ev: dict) -> str:
+def _is_complete_response(ev: dict) -> bool:
+    """A "response" event (sent or received) is only useful as a graph node if
+    it identifies which request it belongs to. Some response breakpoints
+    (e.g. Caddy's responseRecorder, httptest.ResponseRecorder) fire with only
+    a status code and no method/path in their message (FindContext resolves
+    the *context* via the caller frame, but the message-extraction handler
+    still only reads what's in its own frame) — those aren't worth a node,
+    unless a new-style api_id/pattern key is available for them instead.
+    Request events have no status code at all, so this check doesn't apply.
+    """
+    if "response" not in ev.get("kind", "").lower():
+        return True
+    if _new_key(ev) is not None:
+        return True
     msg = ev.get("message", {})
-    return "{" + ", ".join(f"{k}: {v}" for k, v in sorted(msg.items())
-                           if _normalize_key(k)[len("req."):] not in _EXCLUDE_SUFFIXES) + "}"
+    has_code = any("code" in k.lower() for k in msg)
+    has_method = any(k.endswith("Method") for k in msg)
+    has_path = any(k.endswith("URL.Path") for k in msg)
+    return has_code and has_method and has_path
+
+
+def _label_fields(ev: dict) -> list[tuple[str, str]]:
+    """Return the (field, value) pairs to display for this event's node,
+    preferring the new api_id/request_id/pattern fields when available."""
+    kind = ev.get("kind", "")
+    api_id = ev.get("api_id")
+    if api_id and kind == "Request sent":
+        rid = ev.get("request_id") or {}
+        if rid.get("method") and rid.get("path"):
+            return [("api_id", api_id), ("method", rid["method"]), ("path", rid["path"])]
+    elif api_id and kind == "Response sent":
+        pattern = ev.get("pattern")
+        if pattern:
+            return [("api_id", api_id), ("pattern", pattern)]
+    msg = ev.get("message", {})
+    return sorted((k, v) for k, v in msg.items()
+                  if _normalize_key(k)[len("req."):] not in _EXCLUDE_SUFFIXES)
+
+
+def _msg_label(ev: dict) -> str:
+    return "{" + ", ".join(f"{k}: {v}" for k, v in _label_fields(ev)) + "}"
 
 
 def main() -> None:
@@ -54,7 +127,16 @@ def main() -> None:
                         help="Output format (default: text)")
     parser.add_argument("--recv-sent", action="store_true",
                         help="Only draw edges from a received message to a later sent message")
+    parser.add_argument("--include-host", action="store_true",
+                        help="Include URL.Host in node identity/labels (excluded by default, "
+                             "since two otherwise-identical messages sent to different hosts "
+                             "would otherwise be treated as distinct nodes)")
     args = parser.parse_args()
+
+    global _EXCLUDE_SUFFIXES
+    _EXCLUDE_SUFFIXES = set(_ALWAYS_EXCLUDE_SUFFIXES)
+    if not args.include_host:
+        _EXCLUDE_SUFFIXES.add("URL.Host")
 
     # root_addr -> list of (key, kind) in arrival order
     groups: dict[str, list] = defaultdict(list)
@@ -66,6 +148,8 @@ def main() -> None:
     for ev in load_events(args.file):
         root = ev.get("context", {}).get("root_addr")
         if not root or "message" not in ev:
+            continue
+        if not _is_complete_response(ev):
             continue
         key = _msg_key(ev)
         if key not in groups_seen[root]:
@@ -99,16 +183,47 @@ def main() -> None:
         print("(no edges found)")
         return
 
-    # Assign short IDs to each message node
-    all_keys = sorted({k for edge in edges for k in edge})
+    # Assign short IDs to each message node. Sort by repr, not tuple
+    # comparison directly: legacy keys are tuples of (field, value) pairs
+    # while new-style (api_id-based) keys are flat tuples of strings, and
+    # Python can't compare across those shapes.
+    all_keys = sorted({k for edge in edges for k in edge}, key=repr)
     node_id = {k: i for i, k in enumerate(all_keys)}
+
+    # Group nodes into connected components (treating edges as undirected)
+    # to report cluster sizes.
+    parent = {k: k for k in all_keys}
+
+    def find(x: tuple) -> tuple:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: tuple, b: tuple) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for a, b in edges:
+        union(a, b)
+
+    clusters: dict[tuple, list] = defaultdict(list)
+    for k in all_keys:
+        clusters[find(k)].append(k)
+    cluster_sizes = sorted((len(v) for v in clusters.values()), reverse=True)
+
+    summary_lines = [
+        f"Total unique nodes: {len(all_keys)}",
+        f"Total unique edges: {len(edges)}",
+        f"Clusters: {len(clusters)}",
+        "Cluster sizes: " + ", ".join(str(s) for s in cluster_sizes),
+    ]
 
     if args.format == "dot":
         def _dot_label(ev: dict) -> str:
             kind = ev.get("kind", "?")
-            msg = ev.get("message", {})
-            fields = "\\n".join(f"{k}: {v}" for k, v in sorted(msg.items())
-                                if _normalize_key(k)[len("req."):] not in _EXCLUDE_SUFFIXES)
+            fields = "\\n".join(f"{k}: {v}" for k, v in _label_fields(ev))
             return f"{kind}\\n{fields}"
 
         print("digraph messages {")
@@ -119,6 +234,9 @@ def main() -> None:
         for a, b in sorted(edges, key=lambda e: (node_id[e[0]], node_id[e[1]])):
             print(f"  n{node_id[a]} -> n{node_id[b]}")
         print("}")
+
+        # Printed to stderr (not stdout) so piping into `dot` still works.
+        print("\n".join(summary_lines), file=sys.stderr)
     else:
         print("Nodes:")
         for k in all_keys:
@@ -129,6 +247,10 @@ def main() -> None:
         print(f"\nEdges ({len(edges)}):")
         for a, b in sorted(edges, key=lambda e: (node_id[e[0]], node_id[e[1]])):
             print(f"  [{node_id[a]}] -> [{node_id[b]}]")
+
+        print("\nSummary:")
+        for line in summary_lines:
+            print(f"  {line}")
 
 
 if __name__ == "__main__":

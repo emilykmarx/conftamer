@@ -117,10 +117,10 @@ index d6a8010..c7acb37 100644
  		if !shouldRedirect {
 diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-conftamer/src/net/http/conftamer.go
 new file mode 100644
-index 0000000..36859b7
+index 0000000..9098c17
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,326 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// This reproduces, in-process, what contexttrack/ previously did with a Delve
@@ -140,6 +140,7 @@ index 0000000..36859b7
 +import (
 +	"context"
 +	"encoding/json"
++	"fmt"
 +	"os"
 +	"runtime"
 +	"strconv"
@@ -155,15 +156,18 @@ index 0000000..36859b7
 +	conftamerMu      sync.Mutex
 +	conftamerFile    *os.File
 +	conftamerEnabled bool
++	conftamerPath    string
++	conftamerOpenErr error
 +)
 +
 +func conftamerInit() {
-+	path := os.Getenv("CONFTAMER_EVENTS")
-+	if path == "" {
++	conftamerPath = os.Getenv("CONFTAMER_EVENTS")
++	if conftamerPath == "" {
 +		return
 +	}
-+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
++	f, err := os.OpenFile(conftamerPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 +	if err != nil {
++		conftamerOpenErr = err
 +		return
 +	}
 +	conftamerFile = f
@@ -174,6 +178,28 @@ index 0000000..36859b7
 +func conftamerOn() bool {
 +	conftamerOnce.Do(conftamerInit)
 +	return conftamerEnabled
++}
++
++// init prints a one-line diagnostic to stderr at process start whenever the
++// user opted in via CONFTAMER_EVENTS. It runs eagerly (not lazily on the first
++// hook) precisely so the "no events at all" case is self-explaining: if you set
++// CONFTAMER_EVENTS and a binary built with this toolchain runs, you WILL see
++// this line — its absence means the instrumented net/http was not linked (wrong
++// toolchain / cached test binary that didn't run). Silent when CONFTAMER_EVENTS
++// is unset, so ordinary programs are unaffected.
++func init() {
++	if os.Getenv("CONFTAMER_EVENTS") == "" {
++		return
++	}
++	if conftamerOn() {
++		mode := "id"
++		if conftamerJoinAddr {
++			mode = "addr"
++		}
++		fmt.Fprintf(os.Stderr, "conftamer: enabled — writing %q (join=%s)\n", conftamerPath, mode)
++	} else {
++		fmt.Fprintf(os.Stderr, "conftamer: CONFTAMER_EVENTS=%q set but open failed: %v\n", conftamerPath, conftamerOpenErr)
++	}
 +}
 +
 +// --- event schema (mirrors contexttrack/client/main.go) --------------------

@@ -66,6 +66,42 @@ GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
   ~/go-conftamer/bin/go test ./scrape/ -run TestTargetScraperScrapeOK -count=1
 ```
 
+**`-count=1` is mandatory.** `go test` caches results; a cached package is **not
+re-executed**, so its binary never runs and **no events are produced**. An empty or
+absent output file after a `go test` run is most often a missing `-count=1`.
+
+**Confirming the clone is linked.** With `CONFTAMER_EVENTS` set, every binary built
+with this toolchain prints one line to stderr at startup:
+
+```
+conftamer: enabled — writing "/…/prom_test.jsonl" (join=id)
+```
+
+(or `conftamer: … open failed: …` if the output directory is missing). Under
+`go test` this line only shows for packages run with `-v`, but the output file is
+created **eagerly** as soon as any instrumented binary starts. So: file appears
+(even empty) → clone linked, just no HTTP in those tests; file never appears with
+`-count=1` → the instrumented `net/http` was not linked (wrong `go`, a hermetic/
+`make` build, or a bad `CONFTAMER_EVENTS` dir — run `-v` to see the reason).
+
+## Targets other than Prometheus (Caddy, Kubernetes)
+
+The clone instruments **base `net/http` + the bundled `h2_bundle.go`** only, so
+other targets can legitimately produce few or no events:
+
+- **Caddy** configures HTTP/2 via the **external** `golang.org/x/net/http2` (module
+  cache — not patchable by the GOROOT clone) and funnels requests through its own
+  `caddyhttp.(*Server).ServeHTTP`, not `net/http.serverHandler.ServeHTTP`. With
+  Caddy's automatic-HTTPS default, nearly all traffic is HTTP/2 and **no base hook
+  fires**. Force plaintext HTTP/1 (`curl --http1.1 http://…`) to hit the
+  instrumented funnel. Full coverage needs the Caddy-specific / external-h2 hooks
+  the Delve build had (`common.go`), which are out of scope here.
+- **Kubernetes** `make`/`hack/*` builds fetch their **own** Go via `.go-version`,
+  ignoring the clone; and a real cluster runs prebuilt container images where the
+  clone and `CONFTAMER_EVENTS` don't apply. Only a direct
+  `~/go-conftamer/bin/go test -count=1 <pkgs>` (e.g. client-go / apiserver packages
+  using `httptest`) is instrumented.
+
 Note: use `-count=1` to ensure that packages with cached results get re-executed.
 
 `./scrape/` (scrape client + response handling) and `./web/` (API server) are the
@@ -104,6 +140,45 @@ GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
 ```
 
 ## Running Kubernetes tests
+
+### Don't run `go test ./...` from the k8s root
+
+A naive `~/go-conftamer/bin/go test -count=1 ./...` from `~/kubernetes` reports
+~790 failing packages — but almost all are **`[build failed]`**, not test failures.
+Hundreds of k8s packages don't compile standalone (generated code, build tags,
+cgo, test-only infra), and much of the real HTTP code lives in **separate staging
+modules** that the root module's `./...` doesn't even include. This is inherent to
+k8s's build layout and **unrelated to the instrumentation** — a build failure means
+the package didn't compile, which the added `net/http` logging cannot cause (if it
+had broken `net/http`, *every* package would fail, not ~57%). Confirm with:
+
+```bash
+grep -c '\[build failed\]' "$LOG"
+```
+
+So don't chase a clean `./...`. Scope to packages that build and do HTTP instead —
+either the staging modules (A, no etcd) or the integration packages (B, needs etcd).
+
+### A. Staging modules (no etcd, builds cleanly)
+
+The client/server HTTP code lives under `staging/src/k8s.io/*`, each its own Go
+module. `cd` into one and run its tests — these compile cleanly and emit plenty of
+events. `client-go` is the easiest (httptest-based, no etcd):
+
+```bash
+cd ~/kubernetes/staging/src/k8s.io/client-go
+EV=~/conftamer/contexttrack/events/k8s_clientgo.jsonl
+rm -f "$EV"
+
+GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
+  ~/go-conftamer/bin/go test -count=1 ./transport/... ./rest/... ./tools/...
+# verified: ~22 packages ok, 0 build failures, ~950 events (api_id: k8s.io)
+```
+
+`k8s.io/apiserver` is the other HTTP-rich module (some of its packages need etcd —
+see B).
+
+### B. Integration packages (need etcd)
 
 Note: `etcd` must be on `PATH` — the integration test framework calls
 `exec.LookPath("etcd")` and fails hard otherwise. If missing:
@@ -164,6 +239,9 @@ causality). See [`message_graph`](analysis/message_graph.py) for node/edge detai
 - **`-p 1` for Caddy integration tests** — to avoid port collisions
 - **`etcd` on `PATH`** (Kubernetes) — `framework.EtcdMain` calls
   `exec.LookPath("etcd")` before any test runs.
+- **k8s `./...` "failures" are build failures, not test failures** — expected under
+  naive `go test ./...` and unrelated to instrumentation; scope to staging modules
+  or integration packages instead (see *Running Kubernetes tests*).
 - **504 orphan events** (Kubernetes) — the
   `WithTimeoutForNonLongRunningRequests` filter in apiserver races the request
   handler against a wall-clock deadline. If you see a `resp sent ... 504` with no matching `req received`, up `RequestTimeout` in
