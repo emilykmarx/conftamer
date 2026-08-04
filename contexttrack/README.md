@@ -63,18 +63,18 @@ All tests:
 
 ```bash
 cd ~/prometheus-src # or Prometheus directory
-EV=~/conftamer/contexttrack/events/prom_test.jsonl
-rm -f "$EV"
+unset GOROOT   # a .bashrc-exported GOROOT silently reverts to the vanilla stdlib
+export GOTOOLCHAIN=local
+export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/prom_test.jsonl
+rm -f "$CONFTAMER_EVENTS"
 
-GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
-  ~/go-conftamer/bin/go test -count=1 -v ./...
+~/go-conftamer/bin/go test -count=1 -v ./...
 ```
 
 Or, just one test, e.g.:
 
 ```bash
-GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
-  ~/go-conftamer/bin/go test ./scrape/ -run TestTargetScraperScrapeOK -count=1 -v
+~/go-conftamer/bin/go test ./scrape/ -run TestTargetScraperScrapeOK -count=1 -v
 ```
 
 **`-count=1`**: `go test` caches results; a cached package is not re-executed by
@@ -100,11 +100,10 @@ All integration tests:
 
 ```bash
 cd ~/caddy
-EV=~/conftamer/contexttrack/events/caddy_test.jsonl
-rm -f "$EV"
-
-GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
-  ~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/
+export GOTOOLCHAIN=local
+export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/caddy_test.jsonl
+rm -f "$CONFTAMER_EVENTS"
+~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/
 ```
 
 Note: use `-p 1` to disable parallelization.
@@ -114,16 +113,14 @@ actually execute parallel test processes.
 Or, just one test, e.g.:
 
 ```bash
-GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
-  ~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/ \
+~/go-conftamer/bin/go test -count=1 -p 1 ./caddytest/integration/ \
   -run TestReverseProxySubroutes
 ```
 
 Unit tests:
 
 ```bash
-GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
-  ~/go-conftamer/bin/go test -count=1 ./modules/caddyhttp/reverseproxy/
+~/go-conftamer/bin/go test -count=1 ./modules/caddyhttp/reverseproxy/
 ```
 
 ## Kubernetes
@@ -141,11 +138,11 @@ modules that we should run on.
 
 ```bash
 cd ~/kubernetes/staging/src/k8s.io/client-go
-EV=~/conftamer/contexttrack/events/k8s_clientgo.jsonl
-rm -f "$EV"
+export GOTOOLCHAIN=local
+export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/k8s_test.jsonl
+rm -f "$CONFTAMER_EVENTS"
 
-GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
-  ~/go-conftamer/bin/go test -count=1 ./transport/... ./rest/... ./tools/...
+~/go-conftamer/bin/go test -count=1 ./transport/... ./rest/... ./tools/...
 ```
 
 ### B. Integration packages (need etcd)
@@ -162,19 +159,17 @@ All tests in the endpoints integration package:
 
 ```bash
 cd ~/kubernetes
-EV=~/conftamer/contexttrack/events/k8s_test.jsonl
-rm -f "$EV"
+export GOTOOLCHAIN=local
+export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/k8s_test.jsonl
+rm -f "$CONFTAMER_EVENTS"
 
-GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
-  ~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/
+~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/
 ```
 
 Or, just one test, e.g.:
 
 ```bash
-GOTOOLCHAIN=local CONFTAMER_EVENTS="$EV" \
-  ~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/ \
-  -run TestEndpointWithMultiplePods
+~/go-conftamer/bin/go test -count=1 ./test/integration/endpoints/ -run TestEndpointWithMultiplePods
 ```
 
 `./test/integration/endpoints` (apiserver) is the primary package.
@@ -200,6 +195,11 @@ See [`message_graph`](analysis/message_graph.py) for node/edge details.
 
 ## Notes & gotchas
 
+- **Check `GOROOT`** — if the shell exports
+  `GOROOT` (e.g. `.bashrc` lines added by version managers like `g`), the patched
+  `~/go-conftamer/bin/go` compiles against that stdlib instead of its own patched
+  one. Run `unset GOROOT` first, and verify with
+  `~/go-conftamer/bin/go env GOROOT`.
 - **`GOTOOLCHAIN=local` on every invocation** — results in empty events file
 - **Stale server** (Prometheus, Caddy) — Check with `ss -tlnp | grep 9090` (Prometheus)
   or `2999` (Caddy) and kill the stale PID.
@@ -214,6 +214,10 @@ See [`message_graph`](analysis/message_graph.py) for node/edge details.
   handler against a wall-clock deadline. If you see a `resp sent ... 504` with no matching `req received`, up `RequestTimeout` in
   `staging/src/k8s.io/apiserver/pkg/server/config.go`.
 - **Append-only output** — `rm` the file between isolated runs.
+- **First run after (re)building patched `go` is slow** — any changes to the stdlib
+  require a full rebuild. `go test ./...` on a large module (e.g. all of Prometheus)
+  recompiles the whole stdlib + module graph from scratch before the first test binary starts,
+   which can take several minutes with no output in the meantime. Subsequent runs reuse the cache.
 - **Libraries:** HTTP/1.x and bundled HTTP/2 are instrumented.
   If a test uses a mocked library, it won't work.
 - **`-count 1`** - run all tests, even if cached.
