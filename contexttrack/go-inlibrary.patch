@@ -1,8 +1,7 @@
 diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/net/http/client.go
-index d6a8010..c7acb37 100644
 --- a/usr/local/go/src/net/http/client.go
 +++ b/home/tcr6/go-conftamer/src/net/http/client.go
-@@ -21,6 +21,7 @@ import (
+@@ -21,6 +21,7 @@
  	"net/url"
  	"reflect"
  	"slices"
@@ -10,15 +9,15 @@ index d6a8010..c7acb37 100644
  	"strings"
  	"sync"
  	"sync/atomic"
-@@ -607,6 +608,15 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+@@ -607,6 +608,15 @@
  	}
  	_ = *c // panic early if c is nil; see go.dev/issue/53521
 
 +	// Create or inherit a request ID at the client origin (request sent)
-+   // to create a join key for later "response received."
-+   // Note: every HTTP request runs through `do` before being sent, but this should
-+   // be considered a fallback; ideally, the request context is created or inherited
-+   // at an earlier point. This doesn't mutate the caller's request object.
++	// to create a join key for later "response received."
++	// Note: every HTTP request runs through `do` before being sent, but this should
++	// be considered a fallback; ideally, the request context is created or inherited
++	// at an earlier point. This doesn't mutate the caller's request object.
 +	if conftamerOn() {
 +		req = req.WithContext(conftamerStampID(req.Context()))
 +	}
@@ -26,7 +25,7 @@ index d6a8010..c7acb37 100644
  	var (
  		deadline      = c.deadline()
  		reqs          []*Request
-@@ -739,6 +749,14 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
+@@ -739,6 +749,14 @@
  			return nil, uerr(err)
  		}
 
@@ -36,17 +35,16 @@ index d6a8010..c7acb37 100644
 +			"resp.Status":     resp.Status,
 +			"req.Method":      ireq.Method,
 +			"req.URL.Path":    ireq.URL.Path,
-+		}, ireq.Context(), nil, false)
++		}, ireq.Context(), nil, true, nil)
 +
  		var shouldRedirect, includeBodyOnHop bool
  		redirectMethod, shouldRedirect, includeBodyOnHop = redirectBehavior(req.Method, resp, reqs[0])
  		if !shouldRedirect {
 diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-conftamer/src/net/http/conftamer.go
 new file mode 100644
-index 0000000..232e4f9
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,317 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -62,6 +60,7 @@ index 0000000..232e4f9
 +	"encoding/json"
 +	"fmt"
 +	"os"
++	"reflect"
 +	"runtime"
 +	"strconv"
 +	"strings"
@@ -150,7 +149,7 @@ index 0000000..232e4f9
 +
 +var (
 +	conftamerIDKey  conftamerIDKeyType
-+	conftamerNextID atomic.Uint64      // Next to assign
++	conftamerNextID atomic.Uint64 // Next to assign
 +)
 +
 +// conftamerStampID returns ctx unchanged if it already carries an ID
@@ -191,7 +190,7 @@ index 0000000..232e4f9
 +
 +// --- caller (API_ID) identification ----------------------
 +
-+var conftamerHTTPLayerPackages = map[string]bool{ // skip
++var conftamerHTTPLayerPackages = map[string]bool{
 +	"net/http":               true,
 +	"golang.org/x/net/http2": true,
 +}
@@ -208,7 +207,7 @@ index 0000000..232e4f9
 +	ApiId    string
 +}
 +
-+// conftamerPackageName extracts the import path from a runtime fully-qualified
++// tries to extract the import path from a runtime fully-qualified
 +// function name, e.g. "github.com/prometheus/prometheus/scrape.(*x).scrape" ->
 +// "github.com/prometheus/prometheus/scrape".
 +// The boundary is: drop any "[...]" generic suffix, find the last "/", then the
@@ -228,7 +227,7 @@ index 0000000..232e4f9
 +	return ""
 +}
 +
-+// Derives an organization id from a package import path, e.g.
++// Derives an API id from a package import path, e.g.
 +// "github.com/prometheus/prometheus/scrape" -> "github.com/prometheus",
 +// "k8s.io/client-go/rest" -> "k8s.io". Stdlib paths (no dot in the first
 +// segment) returned unchanged.
@@ -246,9 +245,9 @@ index 0000000..232e4f9
 +	return segs[0]
 +}
 +
-+// conftamerFindCaller walks the current goroutine's stack and returns the first
-+// frame whose package is not an HTTP-layer package. The net/http hook site and
-+// these helper frames are themselves in net/http, so they're skipped naturally.
++// Walks the current goroutine's stack and returns the first
++// frame whose package is not in "conftamerHTTPLayerPackages"
++// (inferred to be "generic helpers" and not the calling applciation).
 +func conftamerFindCaller() *conftamerCaller {
 +	var pcs [50]uintptr
 +	n := runtime.Callers(2, pcs[:])
@@ -269,6 +268,37 @@ index 0000000..232e4f9
 +	return nil
 +}
 +
++// conftamerHandlerCaller identifies the API ID from a not-yet-invoked Handler
++// value. Used for "Request received", where the stack doesn't include the
++// application handler.
++func conftamerHandlerCaller(handler any) *conftamerCaller {
++	if handler == nil {
++		return nil
++	}
++   // get "real" type if this is stored as "any"
++	v := reflect.ValueOf(handler)
++	var pkg, name string
++	if v.Kind() == reflect.Func { // e.g., `http.HandlerFunc(...)`
++       // Get function pointer -> look up address in `runtime` to get func metadata
++		if fn := runtime.FuncForPC(v.Pointer()); fn != nil {
++			name = fn.Name()
++			pkg = conftamerPackageName(name)
++		}
++	} else { // e.g., method on a type
++		t := v.Type()
++		for t.Kind() == reflect.Ptr {
++			t = t.Elem()
++		}
++       // Look for package where type is defined
++		pkg = t.PkgPath()
++		name = t.String()
++	}
++	if pkg == "" || conftamerHTTPLayerPackages[pkg] {
++		return nil
++	}
++	return &conftamerCaller{FuncName: name, Package: pkg, ApiId: conftamerApiID(pkg)}
++}
++
 +// --- metadata --------------------------------------------------------------
 +
 +func conftamerGoID() int {
@@ -287,8 +317,10 @@ index 0000000..232e4f9
 +
 +// conftamerLog records one HTTP event. ctx is the context with ID used for correlation.
 +// reqID (may be nil) is set for "Request sent"; withCaller enables caller identification
-+// for the "sent" kinds.
-+func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool) {
++// for all four kinds. handler (non-nil only for "Request received") is the not-yet-invoked
++// Handler about to serve the request — when set, it's used instead of a stack walk, since
++// the application handler isn't on the stack yet at that log point.
++func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any) {
 +	if !conftamerOn() {
 +		return
 +	}
@@ -305,7 +337,13 @@ index 0000000..232e4f9
 +	}
 +
 +	if withCaller {
-+		if c := conftamerFindCaller(); c != nil {
++		var c *conftamerCaller
++		if handler != nil {
++			c = conftamerHandlerCaller(handler)
++		} else {
++			c = conftamerFindCaller()
++		}
++		if c != nil {
 +			ev.ApiId = c.ApiId
 +			if kind == "Response sent" {
 +				ev.Pattern = c.FuncName
@@ -325,10 +363,9 @@ index 0000000..232e4f9
 +	conftamerMu.Unlock()
 +}
 diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
-index c440e76..f7e385e 100644
 --- a/usr/local/go/src/net/http/h2_bundle.go
 +++ b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
-@@ -6314,6 +6314,7 @@ func (sc *http2serverConn) newWriterAndRequestNoBody(st *http2stream, rp httpcom
+@@ -6314,6 +6314,7 @@
  		Body:       body,
  		Trailer:    res.Trailer,
  	}).WithContext(st.ctx)
@@ -336,7 +373,7 @@ index c440e76..f7e385e 100644
  	rw := sc.newResponseWriter(st, req)
  	return rw, req, nil
  }
-@@ -6385,6 +6386,11 @@ func (sc *http2serverConn) handlerDone() {
+@@ -6385,6 +6386,11 @@
 
  // Run on its own goroutine.
  func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *Request, handler func(ResponseWriter, *Request)) {
@@ -344,11 +381,11 @@ index c440e76..f7e385e 100644
 +		"req.Method":       req.Method,
 +		"req.URL.Path":     req.URL.Path,
 +		"req.URL.RawQuery": req.URL.RawQuery,
-+	}, req.Context(), nil, false)
++	}, req.Context(), nil, true, handler)
  	defer sc.sendServeMsg(http2handlerDoneMsg)
  	didPanic := true
  	defer func() {
-@@ -6940,6 +6946,11 @@ func (w *http2responseWriter) WriteHeader(code int) {
+@@ -6940,6 +6946,11 @@
  	if rws == nil {
  		panic("WriteHeader called after Handler finished")
  	}
@@ -356,15 +393,14 @@ index c440e76..f7e385e 100644
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   rws.req.Method,
 +		"req.URL.Path": rws.req.URL.Path,
-+	}, rws.req.Context(), nil, true)
++	}, rws.req.Context(), nil, true, nil)
  	rws.writeHeader(code)
  }
 
 diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/net/http/server.go
-index d63d5bf..63f8b26 100644
 --- a/usr/local/go/src/net/http/server.go
 +++ b/home/tcr6/go-conftamer/src/net/http/server.go
-@@ -1038,7 +1038,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
+@@ -1038,7 +1038,7 @@
  	delete(req.Header, "Host")
 
  	ctx, cancelCtx := context.WithCancel(ctx)
@@ -373,7 +409,7 @@ index d63d5bf..63f8b26 100644
  	req.RemoteAddr = c.remoteAddr
  	req.TLS = c.tlsState
  	if body, ok := req.Body.(*body); ok {
-@@ -1159,6 +1159,12 @@ func (w *response) WriteHeader(code int) {
+@@ -1159,6 +1159,12 @@
  	}
  	checkWriteHeaderCode(code)
 
@@ -381,28 +417,28 @@ index d63d5bf..63f8b26 100644
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   w.req.Method,
 +		"req.URL.Path": w.req.URL.Path,
-+	}, w.req.Context(), nil, true)
++	}, w.req.Context(), nil, true, nil)
 +
  	if code < 101 || code > 199 {
  		// Sending a 100 Continue or any non-1xx header disables the
  		// automatically-sent 100 Continue from Request.Body.Read.
-@@ -3300,6 +3306,11 @@ type serverHandler struct {
- //
- //go:linkname badServeHTTP net/http.serverHandler.ServeHTTP
- func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
+@@ -3308,6 +3314,12 @@
+ 		handler = globalOptionsHandler{}
+ 	}
+
 +	conftamerLog("Request received", map[string]string{
 +		"req.Method":       req.Method,
 +		"req.URL.Path":     req.URL.Path,
 +		"req.URL.RawQuery": req.URL.RawQuery,
-+	}, req.Context(), nil, false)
- 	handler := sh.srv.Handler
- 	if handler == nil {
- 		handler = DefaultServeMux
++	}, req.Context(), nil, true, handler)
++
+ 	handler.ServeHTTP(rw, req)
+ }
+
 diff --git a/usr/local/go/src/net/http/transport.go b/home/tcr6/go-conftamer/src/net/http/transport.go
-index 26a25d2..5b857cd 100644
 --- a/usr/local/go/src/net/http/transport.go
 +++ b/home/tcr6/go-conftamer/src/net/http/transport.go
-@@ -596,6 +596,12 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
+@@ -596,6 +596,12 @@
  		req.closeBody()
  		return nil, errors.New("http: nil Request.URL")
  	}
@@ -411,7 +447,7 @@ index 26a25d2..5b857cd 100644
 +		"req.URL.Host":     req.URL.Host,
 +		"req.URL.Path":     req.URL.Path,
 +		"req.URL.RawQuery": req.URL.RawQuery,
-+	}, ctx, &conftamerRequestID{Method: req.Method, Host: req.URL.Host, Path: req.URL.Path}, true)
++	}, ctx, &conftamerRequestID{Method: req.Method, Host: req.URL.Host, Path: req.URL.Path}, true, nil)
  	if req.Header == nil {
  		req.closeBody()
  		return nil, errors.New("http: nil Request.Header")

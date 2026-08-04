@@ -9,7 +9,8 @@ i.e., "receiving this request led to sending this follow-on request."
 We define this control flow influence as two messages that share the same
 "root" context (the definition of "root" may be a bit library-specific).
 
-**TODO**: Not confident in the "API ID" logic.
+**TODO**: Not confident in a fair amount of this ("API ID" logic,
+where we're assigning context IDs, and where we're logging).
 
 ## How to Use
 
