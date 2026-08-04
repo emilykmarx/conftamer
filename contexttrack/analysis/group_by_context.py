@@ -14,8 +14,7 @@ from event_io import load_events
 
 
 # message identifier
-# (kind, verb, path, code) tuple used for display and deduplication.
-# TODO: add API_ID
+# (kind, verb, path, code, api_id) tuple used for display and deduplication.
 
 _KIND_LABEL = {
     "Request sent":      ">> req sent   ",
@@ -25,9 +24,10 @@ _KIND_LABEL = {
 }
 
 def _ident(event: dict) -> tuple:
-    kind  = event.get("kind", "?")
-    msg   = event.get("message") or {}
-    label = _KIND_LABEL.get(kind, f"{kind:<14}")
+    kind   = event.get("kind", "?")
+    msg    = event.get("message") or {}
+    api_id = event.get("api_id", "")
+    label  = _KIND_LABEL.get(kind, f"{kind:<14}")
 
     if kind == "Request sent":
         verb = msg.get("req.Method") or msg.get("r.Method", "?")
@@ -59,7 +59,7 @@ def _ident(event: dict) -> tuple:
         path = ""
         code = ""
 
-    return (label, verb, path, code)
+    return (label, verb, path, code, api_id)
 
 
 _KIND_LABEL_CLEAN = {
@@ -71,7 +71,7 @@ _KIND_LABEL_CLEAN = {
 
 def _ident_json(ident: tuple) -> str:
     """For end summary"""
-    label, verb, path, code = ident
+    label, verb, path, code, api_id = ident
     kind = _KIND_LABEL_CLEAN.get(label, label.strip())
     fields = {"kind": kind}
     if verb:
@@ -80,12 +80,14 @@ def _ident_json(ident: tuple) -> str:
         fields["endpoint"] = path
     if code:
         fields["code"] = code
+    if api_id:
+        fields["api_id"] = api_id
     return json.dumps(fields, separators=(", ", ": "))
 
 
 def _format_ident(ident: tuple) -> str:
     """For printing to terminal"""
-    label, verb, path, code = ident
+    label, verb, path, code, api_id = ident
     parts = [label]
     if verb:
         parts.append(verb)
@@ -93,6 +95,8 @@ def _format_ident(ident: tuple) -> str:
         parts.append(path)
     if code:
         parts.append(code)
+    if api_id:
+        parts.append(f"[{api_id}]")
     return "  ".join(parts)
 
 def main() -> None:

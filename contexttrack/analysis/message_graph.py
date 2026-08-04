@@ -42,8 +42,6 @@ def _new_key(ev: dict) -> tuple | None:
     falls back to the legacy _msg_key() logic (older trace files, or
     "Request received"/"Response received" kinds, which this key doesn't
     cover).
-
-    TODO: add API_ID to legacy _msg_key() logic; no need to support backwards-compatibility.
     """
     kind = ev.get("kind", "")
     api_id = ev.get("api_id")
@@ -73,25 +71,9 @@ def _msg_key(ev: dict) -> tuple:
         if suffix in _EXCLUDE_SUFFIXES:
             continue
         pairs[nk] = v
-    return tuple(sorted(pairs.items()))
-
-
-def _is_complete_response(ev: dict) -> bool:
-    """A "response" event (sent or received) is only useful as a graph node if
-    it identifies which request it belongs to. We capture some responses with
-    only a status code and no request in their message.
-    Those aren't worth a node at this point.
-    TODO: change this behavior
-    """`
-    if "response" not in ev.get("kind", "").lower():
-        return True
-    if _new_key(ev) is not None:
-        return True
-    msg = ev.get("message", {})
-    has_code = any("code" in k.lower() for k in msg)
-    has_method = any(k.endswith("Method") for k in msg)
-    has_path = any(k.endswith("URL.Path") for k in msg)
-    return has_code and has_method and has_path
+    key = tuple(sorted(pairs.items()))
+    api_id = ev.get("api_id")
+    return (api_id, key) if api_id else key
 
 
 def _label_fields(ev: dict) -> list[tuple[str, str]]:
@@ -145,8 +127,6 @@ def main() -> None:
     for ev in load_events(args.file):
         root = ev.get("context", {}).get("root_addr")
         if not root or "message" not in ev:
-            continue
-        if not _is_complete_response(ev):
             continue
         key = _msg_key(ev)
         if key not in groups_seen[root]:
