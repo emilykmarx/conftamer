@@ -63,7 +63,7 @@ All tests:
 
 ```bash
 cd ~/prometheus-src # or Prometheus directory
-unset GOROOT   # a .bashrc-exported GOROOT silently reverts to the vanilla stdlib
+unset GOROOT   # a .bashrc-exported GOROOT silently reverts to vanilla stdlib
 export GOTOOLCHAIN=local
 export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/prom_test.jsonl
 rm -f "$CONFTAMER_EVENTS"
@@ -100,6 +100,7 @@ All integration tests:
 
 ```bash
 cd ~/caddy
+unset GOROOT
 export GOTOOLCHAIN=local
 export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/caddy_test.jsonl
 rm -f "$CONFTAMER_EVENTS"
@@ -138,6 +139,7 @@ modules that we should run on.
 
 ```bash
 cd ~/kubernetes/staging/src/k8s.io/client-go
+unset GOROOT
 export GOTOOLCHAIN=local
 export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/k8s_test.jsonl
 rm -f "$CONFTAMER_EVENTS"
@@ -159,6 +161,7 @@ All tests in the endpoints integration package:
 
 ```bash
 cd ~/kubernetes
+unset GOROOT
 export GOTOOLCHAIN=local
 export CONFTAMER_EVENTS=~/conftamer/contexttrack/events/k8s_test.jsonl
 rm -f "$CONFTAMER_EVENTS"
