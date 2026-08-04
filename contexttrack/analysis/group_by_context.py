@@ -40,18 +40,13 @@ def _ident(event: dict) -> tuple:
         code = ""
 
     elif kind == "Response sent":
-        # TODO these special cases are left over from delve approach; update to use
-        # consistent logging format so we don't need this if/else logic.
-        # HTTP/1.x stores at w.req.*; HTTP/2 stores at w.rws.req.*; the
-        # promhttp handler-return fallback (no response-writer field to key
-        # off) stores directly at req.*.
-        verb = msg.get("w.req.Method") or msg.get("w.rws.req.Method") or msg.get("req.Method", "?")
-        path = msg.get("w.req.URL.Path") or msg.get("w.rws.req.URL.Path") or msg.get("req.URL.Path", "/")
+        verb = msg.get("req.Method", "?")
+        path = msg.get("req.URL.Path", "/")
         code = msg.get("code", "?")
 
     elif kind == "Response received":
-        verb = msg.get("ireq.Method", "")
-        path = msg.get("ireq.URL.Path", "")
+        verb = msg.get("req.Method", "")
+        path = msg.get("req.URL.Path", "")
         code = msg.get("resp.StatusCode", msg.get("resp.Status", "?"))
 
     else:
@@ -124,7 +119,7 @@ def main() -> None:
 
     for seq, ev in enumerate(events):
         ctx  = ev.get("context") or {}
-        # TODO change this `root_addr` label
+        # TODO change this `root_addr` label to `context_id`
         addr = ctx.get("root_addr", "?")
 
         if addr == "?" and not args.unknown:

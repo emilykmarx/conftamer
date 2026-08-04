@@ -108,8 +108,8 @@ index d6a8010..c7acb37 100644
 +		conftamerLog("Response received", map[string]string{
 +			"resp.StatusCode": strconv.Itoa(resp.StatusCode),
 +			"resp.Status":     resp.Status,
-+			"ireq.Method":     ireq.Method,
-+			"ireq.URL.Path":   ireq.URL.Path,
++			"req.Method":      ireq.Method,
++			"req.URL.Path":    ireq.URL.Path,
 +		}, ireq.Context(), nil, false)
 +
  		var shouldRedirect, includeBodyOnHop bool
@@ -476,9 +476,9 @@ index c440e76..f7e385e 100644
  		panic("WriteHeader called after Handler finished")
  	}
 +	conftamerLog("Response sent", map[string]string{
-+		"code":               strconv.Itoa(code),
-+		"w.rws.req.Method":   rws.req.Method,
-+		"w.rws.req.URL.Path": rws.req.URL.Path,
++		"code":         strconv.Itoa(code),
++		"req.Method":   rws.req.Method,
++		"req.URL.Path": rws.req.URL.Path,
 +	}, rws.req.Context(), nil, true)
  	rws.writeHeader(code)
  }
@@ -501,9 +501,9 @@ index d63d5bf..63f8b26 100644
  	checkWriteHeaderCode(code)
  
 +	conftamerLog("Response sent", map[string]string{
-+		"code":           strconv.Itoa(code),
-+		"w.req.Method":   w.req.Method,
-+		"w.req.URL.Path": w.req.URL.Path,
++		"code":         strconv.Itoa(code),
++		"req.Method":   w.req.Method,
++		"req.URL.Path": w.req.URL.Path,
 +	}, w.req.Context(), nil, true)
 +
  	if code < 101 || code > 199 {
