@@ -42,6 +42,8 @@ def _new_key(ev: dict) -> tuple | None:
     falls back to the legacy _msg_key() logic (older trace files, or
     "Request received"/"Response received" kinds, which this key doesn't
     cover).
+
+    TODO: add API_ID to legacy _msg_key() logic; no need to support backwards-compatibility.
     """
     kind = ev.get("kind", "")
     api_id = ev.get("api_id")
@@ -76,14 +78,11 @@ def _msg_key(ev: dict) -> tuple:
 
 def _is_complete_response(ev: dict) -> bool:
     """A "response" event (sent or received) is only useful as a graph node if
-    it identifies which request it belongs to. Some response breakpoints
-    (e.g. Caddy's responseRecorder, httptest.ResponseRecorder) fire with only
-    a status code and no method/path in their message (FindContext resolves
-    the *context* via the caller frame, but the message-extraction handler
-    still only reads what's in its own frame) — those aren't worth a node,
-    unless a new-style api_id/pattern key is available for them instead.
-    Request events have no status code at all, so this check doesn't apply.
-    """
+    it identifies which request it belongs to. We capture some responses with
+    only a status code and no request in their message.
+    Those aren't worth a node at this point.
+    TODO: change this behavior
+    """`
     if "response" not in ev.get("kind", "").lower():
         return True
     if _new_key(ev) is not None:
@@ -96,8 +95,6 @@ def _is_complete_response(ev: dict) -> bool:
 
 
 def _label_fields(ev: dict) -> list[tuple[str, str]]:
-    """Return the (field, value) pairs to display for this event's node,
-    preferring the new api_id/request_id/pattern fields when available."""
     kind = ev.get("kind", "")
     api_id = ev.get("api_id")
     if api_id and kind == "Request sent":
@@ -183,10 +180,8 @@ def main() -> None:
         print("(no edges found)")
         return
 
-    # Assign short IDs to each message node. Sort by repr, not tuple
-    # comparison directly: legacy keys are tuples of (field, value) pairs
-    # while new-style (api_id-based) keys are flat tuples of strings, and
-    # Python can't compare across those shapes.
+    # Assign short IDs to each message node.
+    # Not strictly needed, but makes easier to sort.
     all_keys = sorted({k for edge in edges for k in edge}, key=repr)
     node_id = {k: i for i, k in enumerate(all_keys)}
 

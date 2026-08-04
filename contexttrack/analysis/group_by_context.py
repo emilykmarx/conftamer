@@ -1,13 +1,8 @@
 """
-Parse events.jsonl and print HTTP events grouped by root context address.
+Parse events.jsonl and print HTTP events grouped by context ID.
 
 Usage:
     python3 group_by_context.py [events.jsonl]
-
-The root context address is the address of the topmost context.Context in the
-chain at the time each breakpoint fired.  Events sharing a root address were
-(directly or indirectly) derived from the same context, so they belong to the
-same logical request chain.
 """
 
 import argparse
@@ -18,8 +13,9 @@ from collections import defaultdict
 from event_io import load_events
 
 
-# ── message identifier ───────────────────────────────────────────────────────
-# A stable (kind, verb, path, code) tuple used for display and deduplication.
+# message identifier
+# (kind, verb, path, code) tuple used for display and deduplication.
+# TODO: add API_ID
 
 _KIND_LABEL = {
     "Request sent":      ">> req sent   ",
@@ -29,7 +25,6 @@ _KIND_LABEL = {
 }
 
 def _ident(event: dict) -> tuple:
-    """Return (label, verb, path, code) for an event."""
     kind  = event.get("kind", "?")
     msg   = event.get("message") or {}
     label = _KIND_LABEL.get(kind, f"{kind:<14}")
@@ -45,6 +40,8 @@ def _ident(event: dict) -> tuple:
         code = ""
 
     elif kind == "Response sent":
+        # TODO these special cases are left over from delve approach; update to use
+        # consistent logging format so we don't need this if/else logic.
         # HTTP/1.x stores at w.req.*; HTTP/2 stores at w.rws.req.*; the
         # promhttp handler-return fallback (no response-writer field to key
         # off) stores directly at req.*.
@@ -73,6 +70,7 @@ _KIND_LABEL_CLEAN = {
 }
 
 def _ident_json(ident: tuple) -> str:
+    """For end summary"""
     label, verb, path, code = ident
     kind = _KIND_LABEL_CLEAN.get(label, label.strip())
     fields = {"kind": kind}
@@ -86,6 +84,7 @@ def _ident_json(ident: tuple) -> str:
 
 
 def _format_ident(ident: tuple) -> str:
+    """For printing to terminal"""
     label, verb, path, code = ident
     parts = [label]
     if verb:
@@ -96,35 +95,32 @@ def _format_ident(ident: tuple) -> str:
         parts.append(code)
     return "  ".join(parts)
 
-
-# ── main ─────────────────────────────────────────────────────────────────────
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Group events.jsonl entries by root context address"
+        description="Group events.jsonl entries by context ID"
     )
     parser.add_argument(
         "input", nargs="?", default="events.jsonl",
-        help="Path to the JSON Lines file (default: events.jsonl)"
+        help="Path to the JSON Lines file (default: ./events.jsonl)"
     )
     parser.add_argument(
         "--unknown", action="store_true",
-        help="Include events where root_addr could not be determined (?)"
+        help="Include events where context ID not found"
     )
     args = parser.parse_args()
 
-    # ── load ──────────────────────────────────────────────────────────────────
     events = list(load_events(args.input))
 
     if not events:
         sys.exit("No events found.")
 
-    # ── group by root_addr, preserving first-seen order ────────────────────
+    # Preserve first-seen order
     group_order: dict[str, int] = {}
     groups: dict[str, list[tuple[int, dict]]] = defaultdict(list)
 
     for seq, ev in enumerate(events):
         ctx  = ev.get("context") or {}
+        # TODO change this `root_addr` label
         addr = ctx.get("root_addr", "?")
 
         if addr == "?" and not args.unknown:
@@ -138,7 +134,7 @@ def main() -> None:
         sys.exit("No groups to display (all events had unknown root_addr; "
                  "try --unknown).")
 
-    # ── print ─────────────────────────────────────────────────────────────
+    # Display
     sorted_addrs = sorted(group_order, key=lambda a: group_order[a])
 
     print(f"{'═'*66}")
@@ -167,10 +163,8 @@ def main() -> None:
 
         print()
 
-    # ── group-size summary ────────────────────────────────────────────────
-    # Deduplicate groups with identical message content (as frozen multiset
-    # for total, frozen set for unique) so repeated root contexts that saw
-    # exactly the same messages are counted once.
+    # Summary
+    # Deduplicate groups with identical message content
     total_sig_counts: dict[int, int] = defaultdict(int)   # all msgs (with dups)
     unique_sig_counts: dict[int, int] = defaultdict(int)  # unique msgs only
 
@@ -191,7 +185,7 @@ def main() -> None:
 
     print(f"{'═'*66}")
     print(f"  Group size summary — all messages (duplicates included)")
-    print(f"  (groups with identical message multisets counted once)")
+    print(f"  (groups with identical message sets counted once)")
     print(f"{'═'*66}\n")
     for size in sorted(total_sig_counts):
         print(f"  {size} message(s) = {total_sig_counts[size]} group(s)")
@@ -205,7 +199,7 @@ def main() -> None:
         print(f"  {size} message(s) = {unique_sig_counts[size]} group(s)")
     print()
 
-    # ── kind-pair summary ────────────────────────────────────────────────
+    # Summary of "kind-pair" (e.g., Request sent -> Response received) counts across all groups.
     kind_pair_counts: dict[tuple[str, str], int] = defaultdict(int)
     for addr in sorted_addrs:
         kinds_seen: list[str] = []
@@ -229,9 +223,7 @@ def main() -> None:
             print(f"  {ka} -> {kb}: {count}")
     print()
 
-    # ── global edge summary ───────────────────────────────────────────────
-    # For each group, generate consecutive pairs (A, B) from the deduplicated
-    # sequence.
+    # Unique groups with multiple linked messages.
     edge_counts: dict[tuple[tuple, tuple], int] = defaultdict(int)
 
     for addr in sorted_addrs:
