@@ -13,12 +13,12 @@ index d6a8010..c7acb37 100644
 @@ -607,6 +608,15 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
  	}
  	_ = *c // panic early if c is nil; see go.dev/issue/53521
- 
-+	// ConfTamer: stamp/inherit a request ID at the client origin so the
-+	// outbound Request-sent (roundTrip) and its Response-received (below) share
-+	// a join key, and so a call inherited from a server handler's context links
-+	// the outbound request to the inbound one. Uses the returned copy so the
-+	// caller's *Request is not mutated.
+
++	// Create or inherit a request ID at the client origin (request sent)
++   // to create a join key for later "response received."
++   // Note: every HTTP request runs through `do` before being sent, but this should
++   // be considered a fallback; ideally, the request context is created or inherited
++   // at an earlier point. This doesn't mutate the caller's request object.
 +	if conftamerOn() {
 +		req = req.WithContext(conftamerStampID(req.Context()))
 +	}
@@ -29,7 +29,7 @@ index d6a8010..c7acb37 100644
 @@ -739,6 +749,14 @@ func (c *Client) do(req *Request) (retres *Response, reterr error) {
  			return nil, uerr(err)
  		}
- 
+
 +		ireq := reqs[0]
 +		conftamerLog("Response received", map[string]string{
 +			"resp.StatusCode": strconv.Itoa(resp.StatusCode),
@@ -46,19 +46,14 @@ new file mode 100644
 index 0000000..232e4f9
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,277 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
-+// This reproduces, in-process, what contexttrack/ previously did with a Delve
-+// debugger: at a handful of HTTP funnel points it records the message, resolves
-+// the request context's conftamer ID (the correlation join key), and — for
-+// outbound events — identifies the application-level caller. One JSON object is
-+// appended to the file named by $CONFTAMER_EVENTS per event, in the exact
-+// schema the contexttrack/analysis/ scripts consume. If $CONFTAMER_EVENTS is
-+// unset, every hook is a cheap no-op.
-+//
-+// Ported from contexttrack/client/main.go (event schema) and caller_id.go
-+// (FindCaller / packageName / apiIdForPackage).
++// At a handful of HTTP funnel points, records the message, resolves
++// the request context's conftamer ID, and tries to identify the "API ID"
++// (application-level caller).
++// A JSON object is appended to the file named by $CONFTAMER_EVENTS per event.
++// If $CONFTAMER_EVENTS is unset, every hook is a no-op.
 +
 +package http
 +
@@ -73,8 +68,6 @@ index 0000000..232e4f9
 +	"sync"
 +	"sync/atomic"
 +)
-+
-+// --- output sink -----------------------------------------------------------
 +
 +var (
 +	conftamerOnce    sync.Once
@@ -105,12 +98,9 @@ index 0000000..232e4f9
 +}
 +
 +// init prints a one-line diagnostic to stderr at process start whenever the
-+// user opted in via CONFTAMER_EVENTS. It runs eagerly (not lazily on the first
-+// hook) precisely so the "no events at all" case is self-explaining: if you set
-+// CONFTAMER_EVENTS and a binary built with this toolchain runs, you WILL see
-+// this line — its absence means the instrumented net/http was not linked (wrong
-+// toolchain / cached test binary that didn't run). Silent when CONFTAMER_EVENTS
-+// is unset, so ordinary programs are unaffected.
++// user opted in via CONFTAMER_EVENTS.
++// It runs eagerly (not lazily on the first hook) to make it easy to differentiate
++// between "file exists but no events at all" and "file doesn't exist".
 +func init() {
 +	if os.Getenv("CONFTAMER_EVENTS") == "" {
 +		return
@@ -122,7 +112,7 @@ index 0000000..232e4f9
 +	}
 +}
 +
-+// --- event schema (mirrors contexttrack/client/main.go) --------------------
++// --- event schema --------------------
 +
 +type conftamerEvent struct {
 +	Kind        string                `json:"kind"`
@@ -150,24 +140,17 @@ index 0000000..232e4f9
 +	Error     string `json:"error,omitempty"`
 +}
 +
-+// --- correlation join key --------------------------------------------------
++// --- context ID (correlation key) -----------------------------------------
 +//
 +// An explicit, process-local, monotonically-increasing request ID stamped
-+// into the request context at its origin (server ingress or client
-+// Client.do) and inherited by every derived context. The join key for an
-+// event is that ID, found by context.Value walking up the chain. This is
-+// unique-per-origin (no scrape over-merge), traverses every context type (no
-+// under-merge at WithoutCancel/custom wrappers), and never aliases (no
-+// address-reuse false merge) — failure modes an earlier heap-address walk
-+// (context.ConftamerRoot) had; see go-inlibrary-optional.patch.
-+
-+// conftamerIDKey is the context.Value key for the stamped request ID. Its
-+// unexported type makes it collision-proof.
++// into the request context at its origin and inherited by every derived context.
++// conftamerIDKey is the context.Value key for the stamped request ID.
++// It's unexported to avoid colliding with other context.Value keys.
 +type conftamerIDKeyType struct{}
 +
 +var (
 +	conftamerIDKey  conftamerIDKeyType
-+	conftamerNextID atomic.Uint64
++	conftamerNextID atomic.Uint64      // Next to assign
 +)
 +
 +// conftamerStampID returns ctx unchanged if it already carries an ID
@@ -183,9 +166,7 @@ index 0000000..232e4f9
 +	return context.WithValue(ctx, conftamerIDKey, conftamerNextID.Add(1))
 +}
 +
-+// conftamerStampIDIfOn is conftamerStampID gated on the logger being enabled,
-+// so the ingress stamping edits stay a single expression and add zero overhead
-+// when CONFTAMER_EVENTS is unset.
++// conftamerStampIDIfOn is conftamerStampID gated on the logger being enabled.
 +func conftamerStampIDIfOn(ctx context.Context) context.Context {
 +	if !conftamerOn() {
 +		return ctx
@@ -197,9 +178,6 @@ index 0000000..232e4f9
 +	if ctx == nil {
 +		return &conftamerContextInfo{Error: "nil context"}
 +	}
-+	// Inherited ID if present, else a fresh one (a direct Transport.RoundTrip
-+	// origin with an un-tagged context — it has no Response-received event to
-+	// match, so a fresh ID is correct).
 +	id, ok := ctx.Value(conftamerIDKey).(uint64)
 +	if !ok {
 +		id = conftamerNextID.Add(1)
@@ -211,9 +189,9 @@ index 0000000..232e4f9
 +	}
 +}
 +
-+// --- caller identification (ported from caller_id.go) ----------------------
++// --- caller (API_ID) identification ----------------------
 +
-+var conftamerHTTPLayerPackages = map[string]bool{
++var conftamerHTTPLayerPackages = map[string]bool{ // skip
 +	"net/http":               true,
 +	"golang.org/x/net/http2": true,
 +}
@@ -232,8 +210,8 @@ index 0000000..232e4f9
 +
 +// conftamerPackageName extracts the import path from a runtime fully-qualified
 +// function name, e.g. "github.com/prometheus/prometheus/scrape.(*x).scrape" ->
-+// "github.com/prometheus/prometheus/scrape". Import paths may contain dots, so
-+// the boundary is: drop any "[...]" generic suffix, find the last "/", then the
++// "github.com/prometheus/prometheus/scrape".
++// The boundary is: drop any "[...]" generic suffix, find the last "/", then the
 +// first "." after it.
 +func conftamerPackageName(fullName string) string {
 +	name := fullName
@@ -250,10 +228,10 @@ index 0000000..232e4f9
 +	return ""
 +}
 +
-+// conftamerApiID derives an organization id from a package import path, e.g.
++// Derives an organization id from a package import path, e.g.
 +// "github.com/prometheus/prometheus/scrape" -> "github.com/prometheus",
 +// "k8s.io/client-go/rest" -> "k8s.io". Stdlib paths (no dot in the first
-+// segment) are returned unchanged.
++// segment) returned unchanged.
 +func conftamerApiID(pkg string) string {
 +	if pkg == "" {
 +		return ""
@@ -305,13 +283,11 @@ index 0000000..232e4f9
 +	return 0
 +}
 +
-+// --- the logging entry point -----------------------------------------------
++// --- logging entry point -----------------------------------------------
 +
-+// conftamerLog records one HTTP event. kind is one of "Request received",
-+// "Request sent", "Response sent", "Response received". msg holds the extracted
-+// message fields (keys match contexttrack/fmt.go). ctx is the request context
-+// used for correlation. reqID (may be nil) is set for "Request sent"; withCaller
-+// enables caller identification for the "sent" kinds.
++// conftamerLog records one HTTP event. ctx is the context with ID used for correlation.
++// reqID (may be nil) is set for "Request sent"; withCaller enables caller identification
++// for the "sent" kinds.
 +func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool) {
 +	if !conftamerOn() {
 +		return
@@ -361,7 +337,7 @@ index c440e76..f7e385e 100644
  	return rw, req, nil
  }
 @@ -6385,6 +6386,11 @@ func (sc *http2serverConn) handlerDone() {
- 
+
  // Run on its own goroutine.
  func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *Request, handler func(ResponseWriter, *Request)) {
 +	conftamerLog("Request received", map[string]string{
@@ -383,14 +359,14 @@ index c440e76..f7e385e 100644
 +	}, rws.req.Context(), nil, true)
  	rws.writeHeader(code)
  }
- 
+
 diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/net/http/server.go
 index d63d5bf..63f8b26 100644
 --- a/usr/local/go/src/net/http/server.go
 +++ b/home/tcr6/go-conftamer/src/net/http/server.go
 @@ -1038,7 +1038,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
  	delete(req.Header, "Host")
- 
+
  	ctx, cancelCtx := context.WithCancel(ctx)
 -	req.ctx = ctx
 +	req.ctx = conftamerStampIDIfOn(ctx)
@@ -400,7 +376,7 @@ index d63d5bf..63f8b26 100644
 @@ -1159,6 +1159,12 @@ func (w *response) WriteHeader(code int) {
  	}
  	checkWriteHeaderCode(code)
- 
+
 +	conftamerLog("Response sent", map[string]string{
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   w.req.Method,
