@@ -114,8 +114,11 @@ def main() -> None:
         sys.exit("No events found.")
 
     # Preserve first-seen order
-    group_order: dict[str, int] = {}
-    groups: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+    # Grouping key is (pid, context_id): context IDs are assigned by a
+    # process-local counter, so the same "id:N" string is reused by every
+    # process (i.e., one per `go test` package).
+    group_order: dict[tuple, int] = {}
+    groups: dict[tuple, list[tuple[int, dict]]] = defaultdict(list)
 
     for seq, ev in enumerate(events):
         ctx = ev.get("context") or {}
@@ -124,6 +127,7 @@ def main() -> None:
         if context_id == "?" and not args.unknown:
             continue
 
+        context_id = (ev.get("pid", "?"), context_id)
         if context_id not in group_order:
             group_order[context_id] = seq
         groups[context_id].append((seq, ev))
@@ -153,7 +157,8 @@ def main() -> None:
         unique = len(lines)
         total  = len(items)
         unique_str = f" ({unique} unique)" if unique != total else ""
-        print(f"  root context: {context_id}   ({total} event(s){unique_str})")
+        pid, cid = context_id
+        print(f"  root context: pid:{pid} {cid}   ({total} event(s){unique_str})")
         print(f"{'─'*66}")
 
         for line in lines:

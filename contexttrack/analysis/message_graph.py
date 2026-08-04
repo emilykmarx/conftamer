@@ -117,10 +117,10 @@ def main() -> None:
     if not args.include_host:
         _EXCLUDE_SUFFIXES.add("URL.Host")
 
-    # context_id -> list of (key, kind) in arrival order
-    groups: dict[str, list] = defaultdict(list)
-    # context_id -> set of seen keys (for dedup within group)
-    groups_seen: dict[str, set] = defaultdict(set)
+    # (pid, context_id) -> list of (key, kind) in arrival order
+    groups: dict[tuple, list] = defaultdict(list)
+    # context_id ((pid, context_id)) -> set of seen keys (for dedup within group)
+    groups_seen: dict[tuple, set] = defaultdict(set)
     # message key -> one representative event (for labelling)
     msg_rep: dict[tuple, dict] = {}
 
@@ -128,6 +128,7 @@ def main() -> None:
         context_id = ev.get("context", {}).get("context_id")
         if not context_id or "message" not in ev:
             continue
+        context_id = (ev.get("pid"), context_id)
         key = _msg_key(ev)
         if key not in groups_seen[context_id]:
             groups_seen[context_id].add(key)

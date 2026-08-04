@@ -115,6 +115,7 @@ new file mode 100644
 +
 +type conftamerEvent struct {
 +	Kind        string                `json:"kind"`
++	Pid         int                   `json:"pid"`
 +	GoroutineID int                   `json:"goroutine_id"`
 +	ThreadID    int                   `json:"thread_id"`
 +	File        string                `json:"file"`
@@ -329,6 +330,7 @@ new file mode 100644
 +
 +	ev := conftamerEvent{
 +		Kind:        kind,
++		Pid:         os.Getpid(),
 +		GoroutineID: conftamerGoID(),
 +		File:        file,
 +		Line:        line,
