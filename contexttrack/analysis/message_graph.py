@@ -117,21 +117,21 @@ def main() -> None:
     if not args.include_host:
         _EXCLUDE_SUFFIXES.add("URL.Host")
 
-    # root_addr -> list of (key, kind) in arrival order
+    # context_id -> list of (key, kind) in arrival order
     groups: dict[str, list] = defaultdict(list)
-    # root_addr -> set of seen keys (for dedup within group)
+    # context_id -> set of seen keys (for dedup within group)
     groups_seen: dict[str, set] = defaultdict(set)
     # message key -> one representative event (for labelling)
     msg_rep: dict[tuple, dict] = {}
 
     for ev in load_events(args.file):
-        root = ev.get("context", {}).get("root_addr")
-        if not root or "message" not in ev:
+        context_id = ev.get("context", {}).get("context_id")
+        if not context_id or "message" not in ev:
             continue
         key = _msg_key(ev)
-        if key not in groups_seen[root]:
-            groups_seen[root].add(key)
-            groups[root].append((key, ev.get("kind", "")))
+        if key not in groups_seen[context_id]:
+            groups_seen[context_id].add(key)
+            groups[context_id].append((key, ev.get("kind", "")))
         if key not in msg_rep:
             msg_rep[key] = ev
 
@@ -143,7 +143,7 @@ def main() -> None:
 
     # Collect unique directed edges across all groups
     edges: set[tuple] = set()
-    for root, entries in groups.items():
+    for context_id, entries in groups.items():
         if args.recv_sent:
             for i, (ka, kinda) in enumerate(entries):
                 if not _is_received(kinda):

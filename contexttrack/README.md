@@ -1,8 +1,13 @@
-# In-library context tracking
+# Context-Message Tracking
 
 Compile context and message tracing logic directly into a cloned copy of the
 Go standard library. Any program built with this toolchain produces a `jsonl`
 file that can be used with the scripts in `analysis/`.
+
+**Goal** of this is to infer causal relationships between HTTP messages,
+i.e., "receiving this request led to sending this follow-on request."
+We define this control flow influence as two messages that share the same
+"root" context (the definition of "root" may be a bit library-specific).
 
 ## How to Use
 
@@ -12,17 +17,18 @@ Apply [`go-inlibrary.patch`](go-inlibrary.patch) to a cloned copy of Go.
 (I directly copied the contents of `/usr/local/go` into `~/go-conftamer/`
 and applied the patch there.)
 
+Contexts are correlated by a monotonic ID stamped at an HTTP request's origin and
+inherited down the context chain.
+An earlier approach instead walked the context's parent
+chain to a shared root heap address; it's no longer used (false positives
+from heap-address reuse, more vulnerable to custom types) but is preserved as
+[`go-inlibrary-optional.patch`](go-inlibrary-optional.patch).
+
 ### Set Environment Variables
 
 - **`GOTOOLCHAIN=local`** — Without it, Go's `auto` toolchain may download
   a new fork of Go.
 - **`CONFTAMER_EVENTS=/path/to/output.jsonl`** — where events are written.
-
-Optional:
-
-- **`CONFTAMER_JOIN=addr`** — label contexts by heap address of root instead of
-  context ID (`id:N`). May be useful to compare the two approaches, but the former
-  leads to false positives from heap reuse.
 
 Note: when running `go test`, use `-count=1` as an argument to make sure that cached
 tests get re-run. An empty output file may be caused by a missing `-count=1`.
@@ -37,7 +43,7 @@ Each line looks something like this:
 ```json
 {"kind":"Request sent","goroutine_id":435,"file":".../net/http/transport.go","line":599,
  "message":{"req.Method":"GET","req.URL.Host":"127.0.0.1:9090","req.URL.Path":"/metrics","req.URL.RawQuery":""},
- "context":{"source":"req.Context()","type":"context.Context","root_addr":"id:7"},
+ "context":{"source":"req.Context()","type":"context.Context","context_id":"id:7"},
  "request_id":{"method":"GET","host":"127.0.0.1:9090","path":"/metrics"},"api_id":"github.com/prometheus"}
 ```
 

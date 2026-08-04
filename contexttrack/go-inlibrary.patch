@@ -1,77 +1,3 @@
-diff --git a/home/tcr6/go-conftamer/src/context/conftamer.go b/home/tcr6/go-conftamer/src/context/conftamer.go
-new file mode 100644
-index 0000000..8103c44
---- /dev/null
-+++ b/home/tcr6/go-conftamer/src/context/conftamer.go
-@@ -0,0 +1,68 @@
-+// ConfTamer instrumentation: in-process reimplementation of the context
-+// parent-chain walk that contexttrack/ previously performed over Delve's RPC
-+// (see contexttrack/context_finder.go: walkContextChain / parentPointers).
-+//
-+// Living inside package context gives direct access to the unexported parent
-+// fields of the concrete context types, so the walk needs no reflection or
-+// debugger. The net/http-scope stop rule is supplied by the caller as a
-+// predicate over a valueCtx's key, so context needs no dependency on net/http.
-+
-+package context
-+
-+import "unsafe"
-+
-+// ConftamerRoot walks the parent chain starting from ctx, following the three
-+// concrete context types the tracer understands — *valueCtx, *cancelCtx and
-+// *timerCtx — and returns the address of the root (topmost reached) context as
-+// a uintptr, or 0 if ctx is nil. The address is an opaque, process-stable join
-+// key: two events whose contexts walk to the same root are correlated.
-+//
-+// The walk stops (without crossing) before a *valueCtx whose key satisfies
-+// stop. net/http passes a stop that matches its own connection/server-scoped
-+// keys (ServerContextKey, LocalAddrContextKey); crossing those would wrongly
-+// unify every request on a connection — or the whole server — under one root.
-+// The walk also stops at any context type it can't traverse (Background/TODO,
-+// WithoutCancel, or a caller's custom wrapper), capped at 15 levels. These stop
-+// conditions mirror contexttrack's original behavior exactly.
-+func ConftamerRoot(ctx Context, stop func(key any) bool) uintptr {
-+	if ctx == nil {
-+		return 0
-+	}
-+	cur := ctx
-+	curAddr := ctxAddr(cur)
-+	for range 15 {
-+		var parent Context
-+		switch c := cur.(type) {
-+		case *valueCtx:
-+			parent = c.Context
-+		case *cancelCtx:
-+			parent = c.Context
-+		case *timerCtx:
-+			parent = c.cancelCtx.Context
-+		default:
-+			// Unknown / uncrossable context type — this is the root.
-+			return curAddr
-+		}
-+		if parent == nil {
-+			return curAddr
-+		}
-+		// If the parent is a net/http-scoped valueCtx, stop without crossing.
-+		if vc, ok := parent.(*valueCtx); ok && stop != nil && stop(vc.key) {
-+			return curAddr
-+		}
-+		cur = parent
-+		curAddr = ctxAddr(cur)
-+	}
-+	return curAddr
-+}
-+
-+// ctxAddr returns the address of the concrete value stored in the interface c.
-+// For the pointer-typed contexts the walk crosses, this is the struct pointer
-+// (matching the address Delve reported as root_addr). For a zero-size value
-+// context (e.g. Background()), it is the shared zerobase address — the same
-+// over-merging behavior the original Delve walk exhibited.
-+func ctxAddr(c Context) uintptr {
-+	// An interface value is a (type, data) word pair; the second word holds
-+	// the pointer to (or the pointer-shaped value of) the concrete data.
-+	return uintptr((*[2]unsafe.Pointer)(unsafe.Pointer(&c))[1])
-+}
 diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/net/http/client.go
 index d6a8010..c7acb37 100644
 --- a/usr/local/go/src/net/http/client.go
@@ -117,23 +43,22 @@ index d6a8010..c7acb37 100644
  		if !shouldRedirect {
 diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-conftamer/src/net/http/conftamer.go
 new file mode 100644
-index 0000000..9098c17
+index 0000000..232e4f9
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,301 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// This reproduces, in-process, what contexttrack/ previously did with a Delve
 +// debugger: at a handful of HTTP funnel points it records the message, resolves
-+// the request context's root address (the correlation join key), and — for
++// the request context's conftamer ID (the correlation join key), and — for
 +// outbound events — identifies the application-level caller. One JSON object is
 +// appended to the file named by $CONFTAMER_EVENTS per event, in the exact
 +// schema the contexttrack/analysis/ scripts consume. If $CONFTAMER_EVENTS is
 +// unset, every hook is a cheap no-op.
 +//
-+// Ported from contexttrack/client/main.go (event schema), context_finder.go
-+// (ContextInfo, the parent-chain walk — now context.ConftamerRoot) and
-+// caller_id.go (FindCaller / packageName / apiIdForPackage).
++// Ported from contexttrack/client/main.go (event schema) and caller_id.go
++// (FindCaller / packageName / apiIdForPackage).
 +
 +package http
 +
@@ -172,7 +97,6 @@ index 0000000..9098c17
 +	}
 +	conftamerFile = f
 +	conftamerEnabled = true
-+	conftamerJoinAddr = os.Getenv("CONFTAMER_JOIN") == "addr"
 +}
 +
 +func conftamerOn() bool {
@@ -192,11 +116,7 @@ index 0000000..9098c17
 +		return
 +	}
 +	if conftamerOn() {
-+		mode := "id"
-+		if conftamerJoinAddr {
-+			mode = "addr"
-+		}
-+		fmt.Fprintf(os.Stderr, "conftamer: enabled — writing %q (join=%s)\n", conftamerPath, mode)
++		fmt.Fprintf(os.Stderr, "conftamer: enabled — writing %q\n", conftamerPath)
 +	} else {
 +		fmt.Fprintf(os.Stderr, "conftamer: CONFTAMER_EVENTS=%q set but open failed: %v\n", conftamerPath, conftamerOpenErr)
 +	}
@@ -224,33 +144,30 @@ index 0000000..9098c17
 +}
 +
 +type conftamerContextInfo struct {
-+	Source   string `json:"source,omitempty"`
-+	Type     string `json:"type,omitempty"`
-+	RootAddr string `json:"root_addr,omitempty"`
-+	Error    string `json:"error,omitempty"`
++	Source    string `json:"source,omitempty"`
++	Type      string `json:"type,omitempty"`
++	ContextID string `json:"context_id,omitempty"`
++	Error     string `json:"error,omitempty"`
 +}
 +
 +// --- correlation join key --------------------------------------------------
 +//
-+// Default ("id" mode): an explicit, process-local, monotonically-increasing
-+// request ID stamped into the request context at its origin (server ingress or
-+// client Client.do) and inherited by every derived context. The join key for an
++// An explicit, process-local, monotonically-increasing request ID stamped
++// into the request context at its origin (server ingress or client
++// Client.do) and inherited by every derived context. The join key for an
 +// event is that ID, found by context.Value walking up the chain. This is
 +// unique-per-origin (no scrape over-merge), traverses every context type (no
 +// under-merge at WithoutCancel/custom wrappers), and never aliases (no
-+// address-reuse false merge) — the three failure modes of the address walk.
-+//
-+// "addr" mode (CONFTAMER_JOIN=addr): the original Delve-faithful heap-address
-+// walk (context.ConftamerRoot), kept for A/B regression comparison.
++// address-reuse false merge) — failure modes an earlier heap-address walk
++// (context.ConftamerRoot) had; see go-inlibrary-optional.patch.
 +
 +// conftamerIDKey is the context.Value key for the stamped request ID. Its
 +// unexported type makes it collision-proof.
 +type conftamerIDKeyType struct{}
 +
 +var (
-+	conftamerIDKey    conftamerIDKeyType
-+	conftamerNextID   atomic.Uint64
-+	conftamerJoinAddr bool // set from CONFTAMER_JOIN=addr in conftamerInit
++	conftamerIDKey  conftamerIDKeyType
++	conftamerNextID atomic.Uint64
 +)
 +
 +// conftamerStampID returns ctx unchanged if it already carries an ID
@@ -276,37 +193,21 @@ index 0000000..9098c17
 +	return conftamerStampID(ctx)
 +}
 +
-+// conftamerScopeStop reports whether a valueCtx key is one of net/http's own
-+// connection/server-scoped keys (ServerContextKey, LocalAddrContextKey), which
-+// use the unexported *contextKey type. The address walk must not cross these.
-+func conftamerScopeStop(k any) bool {
-+	_, ok := k.(*contextKey)
-+	return ok
-+}
-+
 +func conftamerContext(ctx context.Context) *conftamerContextInfo {
 +	if ctx == nil {
 +		return &conftamerContextInfo{Error: "nil context"}
 +	}
-+	root := "?"
-+	if conftamerJoinAddr {
-+		if a := context.ConftamerRoot(ctx, conftamerScopeStop); a != 0 {
-+			root = "0x" + strconv.FormatUint(uint64(a), 16)
-+		}
-+	} else {
-+		// id mode: inherited ID if present, else a fresh one (a direct
-+		// Transport.RoundTrip origin with an un-tagged context — it has no
-+		// Response-received event to match, so a fresh ID is correct).
-+		id, ok := ctx.Value(conftamerIDKey).(uint64)
-+		if !ok {
-+			id = conftamerNextID.Add(1)
-+		}
-+		root = "id:" + strconv.FormatUint(id, 10)
++	// Inherited ID if present, else a fresh one (a direct Transport.RoundTrip
++	// origin with an un-tagged context — it has no Response-received event to
++	// match, so a fresh ID is correct).
++	id, ok := ctx.Value(conftamerIDKey).(uint64)
++	if !ok {
++		id = conftamerNextID.Add(1)
 +	}
 +	return &conftamerContextInfo{
-+		Source:   "req.Context()",
-+		Type:     "context.Context",
-+		RootAddr: root,
++		Source:    "req.Context()",
++		Type:      "context.Context",
++		ContextID: "id:" + strconv.FormatUint(id, 10),
 +	}
 +}
 +

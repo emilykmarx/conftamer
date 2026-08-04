@@ -118,30 +118,29 @@ def main() -> None:
     groups: dict[str, list[tuple[int, dict]]] = defaultdict(list)
 
     for seq, ev in enumerate(events):
-        ctx  = ev.get("context") or {}
-        # TODO change this `root_addr` label to `context_id`
-        addr = ctx.get("root_addr", "?")
+        ctx = ev.get("context") or {}
+        context_id = ctx.get("context_id", "?")
 
-        if addr == "?" and not args.unknown:
+        if context_id == "?" and not args.unknown:
             continue
 
-        if addr not in group_order:
-            group_order[addr] = seq
-        groups[addr].append((seq, ev))
+        if context_id not in group_order:
+            group_order[context_id] = seq
+        groups[context_id].append((seq, ev))
 
     if not groups:
-        sys.exit("No groups to display (all events had unknown root_addr; "
+        sys.exit("No groups to display (all events had unknown context_id; "
                  "try --unknown).")
 
     # Display
-    sorted_addrs = sorted(group_order, key=lambda a: group_order[a])
+    sorted_ids = sorted(group_order, key=lambda a: group_order[a])
 
     print(f"{'═'*66}")
-    print(f"  {len(sorted_addrs)} context group(s) from {len(events)} event(s)")
+    print(f"  {len(sorted_ids)} context group(s) from {len(events)} event(s)")
     print(f"{'═'*66}\n")
 
-    for addr in sorted_addrs:
-        items = groups[addr]
+    for context_id in sorted_ids:
+        items = groups[context_id]
         seen: set[tuple] = set()
         lines = []
         for seq, ev in items:
@@ -154,7 +153,7 @@ def main() -> None:
         unique = len(lines)
         total  = len(items)
         unique_str = f" ({unique} unique)" if unique != total else ""
-        print(f"  root context: {addr}   ({total} event(s){unique_str})")
+        print(f"  root context: {context_id}   ({total} event(s){unique_str})")
         print(f"{'─'*66}")
 
         for line in lines:
@@ -170,9 +169,9 @@ def main() -> None:
     seen_total_sigs: set = set()
     seen_unique_sigs: set = set()
 
-    for addr in sorted_addrs:
-        all_idents = tuple(sorted(_ident(ev) for _, ev in groups[addr]))
-        unique_idents = frozenset(_ident(ev) for _, ev in groups[addr])
+    for context_id in sorted_ids:
+        all_idents = tuple(sorted(_ident(ev) for _, ev in groups[context_id]))
+        unique_idents = frozenset(_ident(ev) for _, ev in groups[context_id])
 
         if all_idents not in seen_total_sigs:
             seen_total_sigs.add(all_idents)
@@ -200,10 +199,10 @@ def main() -> None:
 
     # Summary of "kind-pair" (e.g., Request sent -> Response received) counts across all groups.
     kind_pair_counts: dict[tuple[str, str], int] = defaultdict(int)
-    for addr in sorted_addrs:
+    for context_id in sorted_ids:
         kinds_seen: list[str] = []
         seen_idents: set[tuple] = set()
-        for _, ev in groups[addr]:
+        for _, ev in groups[context_id]:
             ident = _ident(ev)
             if ident not in seen_idents:
                 seen_idents.add(ident)
@@ -225,8 +224,8 @@ def main() -> None:
     # Unique groups with multiple linked messages.
     edge_counts: dict[tuple[tuple, tuple], int] = defaultdict(int)
 
-    for addr in sorted_addrs:
-        items = groups[addr]
+    for context_id in sorted_ids:
+        items = groups[context_id]
         seen: set[tuple] = set()
         seq_idents: list[tuple] = []
         for _, ev in items:
