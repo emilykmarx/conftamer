@@ -41,7 +41,7 @@ type MsgField struct {
 // Modules should call this when they send or receive an API message (on the sending/receiving goroutine).
 // Log message info: which API call this message corresponds to, and contents
 // TODO messages can be sent concurrently -
-// check if csv writer is concurrency-safe, and match method entry/exit logs to message logs (log goroutine ID)
+// check if csv writer is concurrency-safe
 func LogAPIMessage(api_call_id APICallID, msg_contents []MsgField) {
 	w := csv.NewWriter(os.Stdout)
 	contents_bytes, err := json.Marshal(msg_contents)
