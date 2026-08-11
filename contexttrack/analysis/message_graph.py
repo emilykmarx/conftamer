@@ -26,17 +26,113 @@ _EXCLUDE_KEYS = {"req.URL.RawQuery"}
 
 
 def _req_identity(ev: dict) -> tuple | None:
-    """(method, path) of request, or None."""
+    """(method, path) of request event, or None."""
     msg = ev.get("message", {})
     method, path = msg.get("req.Method"), msg.get("req.URL.Path")
     return (method, path) if method and path else None
 
 
-def _attribute_response(ev: dict, group: tuple, open_requests: dict,
-                        last_route: dict) -> None:
-    """Attribute a "Response sent" event to the request it (likely) answers.
-    Copy that request's api_id into the response event, plus the route pattern
-    that got it there.
+def _route_key(ev: dict) -> tuple | None:
+    """(pid, context_id, method, path) — how a matched route pattern is tied to
+    the request and response events it belongs to."""
+    context_id = (ev.get("context") or {}).get("context_id")
+    ident = _req_identity(ev)
+    if not context_id or ident is None:
+        return None
+    return (ev.get("pid"), context_id, *ident)
+
+
+def _full_pattern(orig_path: str, hop_path: str, last_pattern: str) -> str:
+    """Recover the full routing pattern that matched on the URL that the client sent.
+    This lets us deal with `StripPrefix`/path rewriting, which seems to be common.
+
+    orig_path: original full request path
+    hop_path: path as seen by the last mux that matched the request
+    last_pattern: route pattern matched by the last mux
+    """
+    # Not sure if this is possible?
+    if not orig_path.endswith(hop_path):
+        raise AssertionError(f"orig_path={orig_path} hop_path={hop_path} pattern={last_pattern}")
+
+    # No prefix stripping
+    if hop_path == orig_path:
+        return last_pattern
+    # Prefixes removed before the last mux
+    prefix = orig_path[:len(orig_path) - len(hop_path)]
+    # Get the 'path' part of the pattern (after method+host, if any)
+    slash = last_pattern.find("/")
+    if slash < 0:
+        # Go's parsePattern rejects a pattern with no `/` in it; this shouldn't happen
+        raise AssertionError(f"pattern without '/': {pattern}")
+
+    # method+host (if any) + prefixes stripped by prev muxes + last mux's pattern
+    return last_pattern[:slash] + prefix + last_pattern[slash:]
+
+
+def _stamp_routes(events: list[dict]) -> None:
+    """Stamp every event with 'route_pattern', the route a ServeMux matched for
+    it (see conftamerLogRouted in the Go patch).
+
+    Note that "Request routed" events are logged after "Request received", so
+    we need to pre-build this.
+
+    One request can be routed by several muxes. We identify the full path by
+    (1) finding the last "request routed" in the chain, and (2) taking the
+    prefix of the original path up to that point.
+    """
+    # (pid, context_id, request) -> request's routed events, in order.
+    # Keyed by the request as first seen.
+    # Note: later muxes behind StripPrefix route on a shortened path, so
+    # we can't key directly on the (original) request.
+    # Match routes with: (1) exact match on pid, context_id, method, and (2)
+    # path is a suffix of the last-seen path with that key.
+    hops: dict[tuple, list[dict]] = {}
+    # group -> requests seen in it, so a hop only scans its own context group
+    # to find the right key.
+    group_keys: dict[tuple, list[tuple]] = defaultdict(list)
+
+    for ev in events:
+        if ev.get("kind") != "Request routed":
+            continue
+        key = _route_key(ev)
+        if key is None:
+            print("Failed to parse route key for event:", ev, file=sys.stderr)
+            continue
+        path = ev["message"]["req.URL.Path"]
+        for prev in group_keys[key[:2]]:
+            latest = hops[prev][-1]["message"]["req.URL.Path"]
+            if path != latest and latest.endswith(path):
+                hops[prev].append(ev)
+                break
+        else:
+            if key not in hops:
+                hops[key] = []
+                group_keys[key[:2]].append(key)
+            hops[key].append(ev)
+
+    routes: dict[tuple, str] = {}
+    for key, chain in hops.items():
+        first, last = chain[0], chain[-1]
+        # First message: original complete request path
+        # Last message path: request path as seen by last mux
+        # Last message pattern: route pattern matched by last mux
+        # Full pattern returned: original path up to and incl. last mux
+        routes[key] = _full_pattern(
+            first["message"]["req.URL.Path"],
+            last["message"]["req.URL.Path"],
+            last["message"]["pattern"],
+        )
+
+    for ev in events:
+        if ev.get("kind") == "Request routed":
+            continue
+        key = _route_key(ev)
+        if key is not None and key in routes:
+            ev["route_pattern"] = routes[key]
+
+def _attribute_response(ev: dict, group: tuple, open_requests: dict) -> None:
+    """Attribute a "Response sent" event to the request it (likely) answers,
+    copying that request's api_id into the response event.
     """
     ident = _req_identity(ev)
     if ident is None:
@@ -44,11 +140,7 @@ def _attribute_response(ev: dict, group: tuple, open_requests: dict,
     kind = ev.get("kind", "")
     if kind == "Request received":
         open_requests[(group, ident)] = ev
-    elif kind == "Request routed":
-        last_route[group] = ev["message"]["pattern"]
     elif kind == "Response sent":
-        if last_route.get(group):
-            ev["route_pattern"] = last_route[group]
         req = open_requests.get((group, ident))
         if req is None:
             return
@@ -60,26 +152,32 @@ def _attribute_response(ev: dict, group: tuple, open_requests: dict,
 
 def _new_key(ev: dict) -> tuple | None:
     """Node key.
-    "Request" events: (kind, api_id, method, path)
-    "Response" events: (kind, api_id, route pattern or path, method, code)
+    "Request" events: (kind, api_id, method, route pattern or path)
+    "Response sent": (kind, api_id, method, route pattern or path, code)
 
-    Prefer pattern over path (fall back to path if no 'pattern').
+    Prefer pattern over path (fall back to path if no 'route_pattern'), so that
+    one wildcard route ('/items/{id}') is a single node rather than one node per
+    concrete path.
 
     Returns None if this event doesn't carry the fields above, so the caller
-    falls back to keying on the "message" fields (responses that matched no
-    request, or "Request received"/"Response received" kinds, which this key
-    doesn't cover).
+    falls back to keying on the "message" fields ("Response received", or events
+    with neither an api_id nor a matched route).
     """
     kind = ev.get("kind", "")
     api_id = ev.get("api_id")
+    route = ev.get("route_pattern")
     if kind == "Request sent":
         if not api_id:
             return None
         rid = ev.get("request_id") or {}
         if rid.get("method") and rid.get("path"):
-            return (kind, api_id, rid["method"], rid["path"])
+            return (kind, api_id, rid["method"], route or rid["path"])
+    elif kind == "Request received":
+        if api_id or route:
+            msg = ev.get("message", {})
+            return (kind, api_id, msg.get("req.Method"),
+                    route or msg.get("req.URL.Path"))
     elif kind == "Response sent":
-        route = ev.get("route_pattern")
         if api_id or route:
             msg = ev.get("message", {})
             return (kind, api_id, msg.get("req.Method"),
@@ -102,14 +200,16 @@ def _msg_key(ev: dict) -> tuple:
 def _label_fields(ev: dict) -> list[tuple[str, str]]:
     kind = ev.get("kind", "")
     api_id = ev.get("api_id")
+    route = ev.get("route_pattern")
     if api_id and kind == "Request sent":
         rid = ev.get("request_id") or {}
         if rid.get("method") and rid.get("path"):
-            return [("api_id", api_id), ("method", rid["method"]), ("path", rid["path"])]
-    elif kind == "Response sent":
+            optional = [("api_id", api_id), ("pattern", route),
+                        ("method", rid["method"]), ("path", rid["path"])]
+            return [(k, v) for k, v in optional if v]
+    elif kind in ("Request received", "Response sent"):
         msg = ev.get("message", {})
-        optional = [("api_id", api_id),
-                    ("pattern", ev.get("route_pattern")),
+        optional = [("api_id", api_id), ("pattern", route),
                     ("method", msg.get("req.Method")),
                     ("path", msg.get("req.URL.Path")), ("code", msg.get("code"))]
         fields = [(k, v) for k, v in optional if v]
@@ -155,15 +255,17 @@ def main() -> None:
     # (group, (method, path)) -> most recent "Request received" with that identity,
     # used to attribute each response back to the request it answers
     open_requests: dict[tuple, dict] = {}
-    # group -> route pattern most recently matched in it (innermost mux wins)
-    last_route: dict[tuple, str] = {}
 
-    for ev in load_events(args.file):
+    # Read in full so routes can be resolved before any event is keyed
+    events = list(load_events(args.file))
+    _stamp_routes(events)
+
+    for ev in events:
         context_id = ev.get("context", {}).get("context_id")
         if not context_id or "message" not in ev:
             continue
         context_id = (ev.get("pid"), context_id)
-        _attribute_response(ev, context_id, open_requests, last_route)
+        _attribute_response(ev, context_id, open_requests)
         # Routing metadata, not a message: contributes its pattern, not a node
         if ev.get("kind") == "Request routed":
             continue
