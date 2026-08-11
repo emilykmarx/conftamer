@@ -197,21 +197,37 @@ def _msg_key(ev: dict) -> tuple:
     return (api_id, key) if api_id else key
 
 
-def _label_fields(ev: dict) -> list[tuple[str, str]]:
+def _event_path(ev: dict) -> str | None:
+    """Concrete URL path of this event, for counting what a pattern covers."""
+    path = ev.get("message", {}).get("req.URL.Path")
+    return path or (ev.get("request_id") or {}).get("path")
+
+
+def _label_fields(ev: dict, n_paths: int | None = None) -> list[tuple[str, str]]:
+    """Label fields for the node `ev` represents.
+
+    When a route pattern matched, it is what the node is keyed on
+    (the node stands for every path the pattern covers).
+    `n_paths` = how many distinct paths landed on this node.
+    """
     kind = ev.get("kind", "")
     api_id = ev.get("api_id")
     route = ev.get("route_pattern")
+    paths = str(n_paths) if route and n_paths else None
     if api_id and kind == "Request sent":
         rid = ev.get("request_id") or {}
         if rid.get("method") and rid.get("path"):
             optional = [("api_id", api_id), ("pattern", route),
-                        ("method", rid["method"]), ("path", rid["path"])]
+                        ("method", rid["method"]),
+                        ("path", None if route else rid["path"]),
+                        ("paths", paths)]
             return [(k, v) for k, v in optional if v]
     elif kind in ("Request received", "Response sent"):
         msg = ev.get("message", {})
         optional = [("api_id", api_id), ("pattern", route),
                     ("method", msg.get("req.Method")),
-                    ("path", msg.get("req.URL.Path")), ("code", msg.get("code"))]
+                    ("path", None if route else msg.get("req.URL.Path")),
+                    ("code", msg.get("code")), ("paths", paths)]
         fields = [(k, v) for k, v in optional if v]
         if fields:
             return fields
@@ -222,8 +238,8 @@ def _label_fields(ev: dict) -> list[tuple[str, str]]:
     return fields
 
 
-def _msg_label(ev: dict) -> str:
-    return "{" + ", ".join(f"{k}: {v}" for k, v in _label_fields(ev)) + "}"
+def _msg_label(ev: dict, n_paths: int | None = None) -> str:
+    return "{" + ", ".join(f"{k}: {v}" for k, v in _label_fields(ev, n_paths)) + "}"
 
 
 def main() -> None:
@@ -252,6 +268,9 @@ def main() -> None:
     groups_seen: dict[tuple, set] = defaultdict(set)
     # message key -> one representative event (for labelling)
     msg_rep: dict[tuple, dict] = {}
+    # message key -> distinct concrete paths keyed to it. >1 only for nodes
+    # keyed on a route pattern, which covers every path that pattern matched.
+    node_paths: dict[tuple, set[str]] = defaultdict(set)
     # (group, (method, path)) -> most recent "Request received" with that identity,
     # used to attribute each response back to the request it answers
     open_requests: dict[tuple, dict] = {}
@@ -275,6 +294,9 @@ def main() -> None:
             groups[context_id].append((key, ev.get("kind", "")))
         if key not in msg_rep:
             msg_rep[key] = ev
+        path = _event_path(ev)
+        if path:
+            node_paths[key].add(path)
 
     def _is_received(kind: str) -> bool:
         return "received" in kind.lower()
@@ -337,15 +359,15 @@ def main() -> None:
     ]
 
     if args.format == "dot":
-        def _dot_label(ev: dict) -> str:
+        def _dot_label(ev: dict, n_paths: int) -> str:
             kind = ev.get("kind", "?")
-            fields = "\\n".join(f"{k}: {v}" for k, v in _label_fields(ev))
+            fields = "\\n".join(f"{k}: {v}" for k, v in _label_fields(ev, n_paths))
             return f"{kind}\\n{fields}"
 
         print("digraph messages {")
         print('  node [shape=box fontname="monospace" fontsize=10]')
         for k in all_keys:
-            label = _dot_label(msg_rep[k]).replace('"', '\\"')
+            label = _dot_label(msg_rep[k], len(node_paths[k])).replace('"', '\\"')
             print(f'  n{node_id[k]} [label="{label}"]')
         for a, b in sorted(edges, key=lambda e: (node_id[e[0]], node_id[e[1]])):
             print(f"  n{node_id[a]} -> n{node_id[b]}")
@@ -358,7 +380,7 @@ def main() -> None:
         for k in all_keys:
             ev = msg_rep[k]
             kind = ev.get("kind", "?")
-            print(f"  [{node_id[k]}] {kind}  {_msg_label(ev)}")
+            print(f"  [{node_id[k]}] {kind}  {_msg_label(ev, len(node_paths[k]))}")
 
         print(f"\nEdges ({len(edges)}):")
         for a, b in sorted(edges, key=lambda e: (node_id[e[0]], node_id[e[1]])):
