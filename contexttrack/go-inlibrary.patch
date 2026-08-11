@@ -30,9 +30,9 @@ diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/ne
  		}
 
 +		ireq := reqs[0]
++		// resp.Status is not logged: it only restates resp.StatusCode.
 +		conftamerLog("Response received", map[string]string{
 +			"resp.StatusCode": strconv.Itoa(resp.StatusCode),
-+			"resp.Status":     resp.Status,
 +			"req.Method":      ireq.Method,
 +			"req.URL.Path":    ireq.URL.Path,
 +		}, ireq.Context(), nil, true, nil)
@@ -44,7 +44,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,347 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -124,9 +124,9 @@ new file mode 100644
 +	Context     *conftamerContextInfo `json:"context"`
 +	RequestID   *conftamerRequestID   `json:"request_id,omitempty"`
 +	ApiId       string                `json:"api_id,omitempty"`
-+	// Pattern is the name of the Handler serving a "Request received" event.
++	// Handler is the name of the Handler serving a "Request received" event.
 +	// Not set on "Response sent".
-+	Pattern string `json:"pattern,omitempty"`
++	Handler string `json:"handler,omitempty"`
 +}
 +
 +type conftamerRequestID struct {
@@ -322,14 +322,15 @@ new file mode 100644
 +// reqID (may be nil) is set for "Request sent". withCaller enables caller identification.
 +// handler (non-nil only for "Request received") is the not-yet-invoked Handler about to
 +// serve the request — when set, it's used instead of a stack walk, since the application
-+// handler isn't on the stack yet at that log point, and its name is recorded as Pattern.
++// handler isn't on the stack yet at that log point, and its name is recorded as Handler.
 +//
 +// "Response sent" deliberately does NOT identify a caller: at the point a response is
 +// written, the stack holds whatever the handler last called (fmt.Fprintln,
 +// gzip.(*Writer).Write), not the handler itself, so the walk yields a misleading API.
 +// Responses record only their code plus the method/path of the request they answer;
-+// analysis (contexttrack/analysis/message_graph.py) recovers api_id/pattern by matching
-+// each response back to the "Request received" it answers.
++// analysis (contexttrack/analysis/message_graph.py) recovers api_id/handler by matching
++// each response back to the "Request received" it answers, and the matched route pattern
++// from the "Request routed" events logged by conftamerLogRouted.
 +func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any) {
 +	if !conftamerOn() {
 +		return
@@ -357,7 +358,7 @@ new file mode 100644
 +		if c != nil {
 +			ev.ApiId = c.ApiId
 +			if kind == "Request received" {
-+				ev.Pattern = c.FuncName
++				ev.Handler = c.FuncName
 +			}
 +		}
 +	}
@@ -372,6 +373,24 @@ new file mode 100644
 +	conftamerMu.Lock()
 +	conftamerFile.Write(append(linebytes, '\n'))
 +	conftamerMu.Unlock()
++}
++
++// conftamerLogRouted records the route pattern a ServeMux matched for r, logged from
++// ServeMux.ServeHTTP because that's the only point the pattern is reliably in hand:
++// "Request received" fires before any routing happens, and by "Response sent" a nested
++// mux's pattern has been written to a shallow request copy (see StripPrefix) that the
++// ResponseWriter's request never sees. Nested muxes each log, sharing the request's
++// context ID, so the last one recorded is the innermost — the most specific match.
++// An empty pattern (no route matched) is not logged.
++func conftamerLogRouted(pattern string, r *Request) {
++	if pattern == "" {
++		return
++	}
++	conftamerLog("Request routed", map[string]string{
++		"pattern":      pattern,
++		"req.Method":   r.Method,
++		"req.URL.Path": r.URL.Path,
++	}, r.Context(), nil, false, nil)
 +}
 diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
 --- a/usr/local/go/src/net/http/h2_bundle.go
@@ -435,7 +454,21 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
  	if code < 101 || code > 199 {
  		// Sending a 100 Continue or any non-1xx header disables the
  		// automatically-sent 100 Continue from Request.Body.Read.
-@@ -3308,6 +3315,12 @@
+@@ -2821,9 +2828,12 @@
+ 	}
+ 	var h Handler
+ 	if use121 {
+-		h, _ = mux.mux121.findHandler(r)
++		var pat121 string
++		h, pat121 = mux.mux121.findHandler(r)
++		conftamerLogRouted(pat121, r)
+ 	} else {
+ 		h, r.Pattern, r.pat, r.matches = mux.findHandler(r)
++		conftamerLogRouted(r.Pattern, r)
+ 	}
+ 	h.ServeHTTP(w, r)
+ }
+@@ -3308,6 +3318,12 @@
  		handler = globalOptionsHandler{}
  	}
 

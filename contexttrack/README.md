@@ -52,6 +52,10 @@ Each line looks something like this:
  "request_id":{"method":"GET","host":"127.0.0.1:9090","path":"/metrics"},"api_id":"github.com/prometheus"}
 ```
 
+Kinds are `Request sent`, `Request received`, `Response sent`, `Response received`, plus
+`Request routed` (emitted once per `http.ServeMux` match and used to find the most
+specific `pattern` that corresponds to a request).
+
 Use `analysis/group_by_context.py` to see context groups and `analysis/message_graph.py`
 to generate the full, directed grah.
 

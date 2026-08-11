@@ -6,11 +6,13 @@ Each node is a unique message (identified by the key-value pairs in the
 that immediately follows it (in arrival order) within the same context
 group.  Each unique edge is printed once.
 
+"Request routed" events supply the route pattern for received requests and
+sent responses, when available.
+
 Run to svg: python3 contexttrack/analysis/message_graph.py --format dot | dot -Tsvg > graph.svg
 """
 
 import argparse
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -18,25 +20,23 @@ from pathlib import Path
 from event_io import load_events
 
 
-_PREFIXES = re.compile(r"^(req|ireq|r)\.")
-_ALWAYS_EXCLUDE_SUFFIXES = {"URL.RawQuery"}
-_EXCLUDE_SUFFIXES = set(_ALWAYS_EXCLUDE_SUFFIXES)
-
-
-def _normalize_key(k: str) -> str:
-    return _PREFIXES.sub("req.", k)
+# message fields recorded for debugging but
+# shouldn't go into node identity/labels
+_EXCLUDE_KEYS = {"req.URL.RawQuery"}
 
 
 def _req_identity(ev: dict) -> tuple | None:
-    """(method, path) of the request an event concerns, or None if absent."""
-    fields = {_normalize_key(k): v for k, v in ev.get("message", {}).items()}
-    method, path = fields.get("req.Method"), fields.get("req.URL.Path")
+    """(method, path) of request, or None."""
+    msg = ev.get("message", {})
+    method, path = msg.get("req.Method"), msg.get("req.URL.Path")
     return (method, path) if method and path else None
 
 
-def _attribute_response(ev: dict, group: tuple, open_requests: dict) -> None:
+def _attribute_response(ev: dict, group: tuple, open_requests: dict,
+                        last_route: dict) -> None:
     """Attribute a "Response sent" event to the request it (likely) answers.
-    Copy that request's api_id/pattern into the response event.
+    Copy that request's api_id into the response event, plus the route pattern
+    that got it there.
     """
     ident = _req_identity(ev)
     if ident is None:
@@ -44,44 +44,46 @@ def _attribute_response(ev: dict, group: tuple, open_requests: dict) -> None:
     kind = ev.get("kind", "")
     if kind == "Request received":
         open_requests[(group, ident)] = ev
+    elif kind == "Request routed":
+        last_route[group] = ev["message"]["pattern"]
     elif kind == "Response sent":
+        if last_route.get(group):
+            ev["route_pattern"] = last_route[group]
         req = open_requests.get((group, ident))
         if req is None:
             return
         # Absent if caller identification failed for the request, e.g. it was
         # served by an http.ServeMux rather than an application handler.
-        for field in ("api_id", "pattern"):
-            if req.get(field):
-                ev[field] = req[field]
+        if req.get("api_id"):
+            ev["api_id"] = req["api_id"]
 
 
 def _new_key(ev: dict) -> tuple | None:
-    """API-level node key for events carrying api_id (from the Go tracer's
-    caller-identification: the org that owns the code invoking the HTTP
-    library, found by backtracing past protocol-agnostic HTTP-layer frames).
-    "Request" events key off (kind, api_id, method, path); "Response" events
-    key off (kind, api_id, pattern, method, path, code), where 'code' comes
-    from the response and everything else from the request it answers.
+    """Node key.
+    "Request" events: (kind, api_id, method, path)
+    "Response" events: (kind, api_id, route pattern or path, method, code)
 
-    Returns None if this event doesn't carry the new fields, so the caller
-    falls back to the legacy _msg_key() logic (older trace files, responses
-    that matched no request, or "Request received"/"Response received" kinds,
-    which this key doesn't cover).
+    Prefer pattern over path (fall back to path if no 'pattern').
+
+    Returns None if this event doesn't carry the fields above, so the caller
+    falls back to keying on the "message" fields (responses that matched no
+    request, or "Request received"/"Response received" kinds, which this key
+    doesn't cover).
     """
     kind = ev.get("kind", "")
     api_id = ev.get("api_id")
-    if not api_id:
-        return None
     if kind == "Request sent":
+        if not api_id:
+            return None
         rid = ev.get("request_id") or {}
         if rid.get("method") and rid.get("path"):
             return (kind, api_id, rid["method"], rid["path"])
     elif kind == "Response sent":
-        pattern = ev.get("pattern")
-        if pattern:
+        route = ev.get("route_pattern")
+        if api_id or route:
             msg = ev.get("message", {})
-            return (kind, api_id, pattern, msg.get("req.Method"), msg.get("req.URL.Path"),
-                     msg.get("code"))
+            return (kind, api_id, msg.get("req.Method"),
+                    route or msg.get("req.URL.Path"), msg.get("code"))
     return None
 
 
@@ -91,13 +93,7 @@ def _msg_key(ev: dict) -> tuple:
     if new_key is not None:
         return new_key
     msg = ev.get("message", {})
-    pairs = {}
-    for k, v in msg.items():
-        nk = _normalize_key(k)
-        suffix = nk[len("req."):]
-        if suffix in _EXCLUDE_SUFFIXES:
-            continue
-        pairs[nk] = v
+    pairs = {k: v for k, v in msg.items() if k not in _EXCLUDE_KEYS}
     key = tuple(sorted(pairs.items()))
     api_id = ev.get("api_id")
     return (api_id, key) if api_id else key
@@ -110,21 +106,17 @@ def _label_fields(ev: dict) -> list[tuple[str, str]]:
         rid = ev.get("request_id") or {}
         if rid.get("method") and rid.get("path"):
             return [("api_id", api_id), ("method", rid["method"]), ("path", rid["path"])]
-    elif api_id and kind == "Response sent":
-        pattern = ev.get("pattern")
-        if pattern:
-            msg = ev.get("message", {})
-            fields = [("api_id", api_id), ("pattern", pattern)]
-            if msg.get("req.Method"):
-                fields.append(("method", msg["req.Method"]))
-            if msg.get("req.URL.Path"):
-                fields.append(("path", msg["req.URL.Path"]))
-            if msg.get("code"):
-                fields.append(("code", msg["code"]))
+    elif kind == "Response sent":
+        msg = ev.get("message", {})
+        optional = [("api_id", api_id),
+                    ("pattern", ev.get("route_pattern")),
+                    ("method", msg.get("req.Method")),
+                    ("path", msg.get("req.URL.Path")), ("code", msg.get("code"))]
+        fields = [(k, v) for k, v in optional if v]
+        if fields:
             return fields
     msg = ev.get("message", {})
-    fields = sorted((k, v) for k, v in msg.items()
-                     if _normalize_key(k)[len("req."):] not in _EXCLUDE_SUFFIXES)
+    fields = sorted((k, v) for k, v in msg.items() if k not in _EXCLUDE_KEYS)
     if api_id:
         fields.append(("api_id", api_id))
     return fields
@@ -150,10 +142,9 @@ def main() -> None:
                              "would otherwise be treated as distinct nodes)")
     args = parser.parse_args()
 
-    global _EXCLUDE_SUFFIXES
-    _EXCLUDE_SUFFIXES = set(_ALWAYS_EXCLUDE_SUFFIXES)
+    global _EXCLUDE_KEYS
     if not args.include_host:
-        _EXCLUDE_SUFFIXES.add("URL.Host")
+        _EXCLUDE_KEYS.add("req.URL.Host")
 
     # (pid, context_id) -> list of (key, kind) in arrival order
     groups: dict[tuple, list] = defaultdict(list)
@@ -164,13 +155,18 @@ def main() -> None:
     # (group, (method, path)) -> most recent "Request received" with that identity,
     # used to attribute each response back to the request it answers
     open_requests: dict[tuple, dict] = {}
+    # group -> route pattern most recently matched in it (innermost mux wins)
+    last_route: dict[tuple, str] = {}
 
     for ev in load_events(args.file):
         context_id = ev.get("context", {}).get("context_id")
         if not context_id or "message" not in ev:
             continue
         context_id = (ev.get("pid"), context_id)
-        _attribute_response(ev, context_id, open_requests)
+        _attribute_response(ev, context_id, open_requests, last_route)
+        # Routing metadata, not a message: contributes its pattern, not a node
+        if ev.get("kind") == "Request routed":
+            continue
         key = _msg_key(ev)
         if key not in groups_seen[context_id]:
             groups_seen[context_id].add(key)

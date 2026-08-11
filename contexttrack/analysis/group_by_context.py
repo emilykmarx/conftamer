@@ -14,11 +14,12 @@ from event_io import load_events
 
 
 # message identifier
-# (kind, verb, path, code, api_id) tuple used for display and deduplication.
+# (kind, verb, path/pattern, code, api_id) tuple used for display and deduplication.
 
 _KIND_LABEL = {
     "Request sent":      ">> req sent   ",
     "Request received":  "<< req recvd  ",
+    "Request routed":    "-- req routed ",
     "Response sent":     ">> resp sent  ",
     "Response received": "<< resp recvd ",
 }
@@ -29,14 +30,16 @@ def _ident(event: dict) -> tuple:
     api_id = event.get("api_id", "")
     label  = _KIND_LABEL.get(kind, f"{kind:<14}")
 
-    if kind == "Request sent":
-        verb = msg.get("req.Method") or msg.get("r.Method", "?")
-        path = msg.get("req.URL.Path") or msg.get("r.URL.Path", "/")
+    if kind in ("Request sent", "Request received"):
+        verb = msg.get("req.Method", "?")
+        path = msg.get("req.URL.Path", "/")
         code = ""
 
-    elif kind == "Request received":
-        verb = msg.get("req.Method") or msg.get("r.Method", "?")
-        path = msg.get("req.URL.Path") or msg.get("r.URL.Path", "/")
+    elif kind == "Request routed":
+        # Shows the route pattern matched rather than the concrete path. No verb:
+        # a Go 1.22+ pattern already carries the method ("GET /items/{id}").
+        verb = ""
+        path = msg.get("pattern", "?")
         code = ""
 
     elif kind == "Response sent":
@@ -47,7 +50,7 @@ def _ident(event: dict) -> tuple:
     elif kind == "Response received":
         verb = msg.get("req.Method", "")
         path = msg.get("req.URL.Path", "")
-        code = msg.get("resp.StatusCode", msg.get("resp.Status", "?"))
+        code = msg.get("resp.StatusCode", "?")
 
     else:
         verb = ""
@@ -60,6 +63,7 @@ def _ident(event: dict) -> tuple:
 _KIND_LABEL_CLEAN = {
     ">> req sent   ":  "req sent",
     "<< req recvd  ":  "req recvd",
+    "-- req routed ":  "req routed",
     ">> resp sent  ":  "resp sent",
     "<< resp recvd ":  "resp recvd",
 }
