@@ -32,9 +32,9 @@ def _new_key(ev: dict) -> tuple | None:
     caller-identification: the org that owns the code invoking the HTTP
     library, found by backtracing past protocol-agnostic HTTP-layer frames).
     "Request sent" events key off (kind, api_id, method, path); "Response
-    sent" events key off (kind, api_id, pattern, method, path), where pattern
-    is the name of the handler frame that produced the
-    response and method/path identify the request it's responding to.
+    sent" events key off (kind, api_id, pattern, method, path, code), where
+    pattern is the name of the handler frame that produced the response and
+    method/path/code identify the request/response.
     request_id.host is deliberately excluded from the key — it's frequently
     an ephemeral test-server port that would fragment otherwise-identical
     nodes across runs.
@@ -56,7 +56,8 @@ def _new_key(ev: dict) -> tuple | None:
         pattern = ev.get("pattern")
         if pattern:
             msg = ev.get("message", {})
-            return (kind, api_id, pattern, msg.get("req.Method"), msg.get("req.URL.Path"))
+            return (kind, api_id, pattern, msg.get("req.Method"), msg.get("req.URL.Path"),
+                     msg.get("code"))
     return None
 
 
@@ -94,10 +95,15 @@ def _label_fields(ev: dict) -> list[tuple[str, str]]:
                 fields.append(("method", msg["req.Method"]))
             if msg.get("req.URL.Path"):
                 fields.append(("path", msg["req.URL.Path"]))
+            if msg.get("code"):
+                fields.append(("code", msg["code"]))
             return fields
     msg = ev.get("message", {})
-    return sorted((k, v) for k, v in msg.items()
-                  if _normalize_key(k)[len("req."):] not in _EXCLUDE_SUFFIXES)
+    fields = sorted((k, v) for k, v in msg.items()
+                     if _normalize_key(k)[len("req."):] not in _EXCLUDE_SUFFIXES)
+    if api_id:
+        fields.append(("api_id", api_id))
+    return fields
 
 
 def _msg_label(ev: dict) -> str:
