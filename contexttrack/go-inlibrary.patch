@@ -44,7 +44,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,328 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -124,7 +124,9 @@ new file mode 100644
 +	Context     *conftamerContextInfo `json:"context"`
 +	RequestID   *conftamerRequestID   `json:"request_id,omitempty"`
 +	ApiId       string                `json:"api_id,omitempty"`
-+	Pattern     string                `json:"pattern,omitempty"`
++	// Pattern is the name of the Handler serving a "Request received" event.
++	// Not set on "Response sent".
++	Pattern string `json:"pattern,omitempty"`
 +}
 +
 +type conftamerRequestID struct {
@@ -317,10 +319,17 @@ new file mode 100644
 +// --- logging entry point -----------------------------------------------
 +
 +// conftamerLog records one HTTP event. ctx is the context with ID used for correlation.
-+// reqID (may be nil) is set for "Request sent"; withCaller enables caller identification
-+// for all four kinds. handler (non-nil only for "Request received") is the not-yet-invoked
-+// Handler about to serve the request — when set, it's used instead of a stack walk, since
-+// the application handler isn't on the stack yet at that log point.
++// reqID (may be nil) is set for "Request sent". withCaller enables caller identification.
++// handler (non-nil only for "Request received") is the not-yet-invoked Handler about to
++// serve the request — when set, it's used instead of a stack walk, since the application
++// handler isn't on the stack yet at that log point, and its name is recorded as Pattern.
++//
++// "Response sent" deliberately does NOT identify a caller: at the point a response is
++// written, the stack holds whatever the handler last called (fmt.Fprintln,
++// gzip.(*Writer).Write), not the handler itself, so the walk yields a misleading API.
++// Responses record only their code plus the method/path of the request they answer;
++// analysis (contexttrack/analysis/message_graph.py) recovers api_id/pattern by matching
++// each response back to the "Request received" it answers.
 +func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any) {
 +	if !conftamerOn() {
 +		return
@@ -347,7 +356,7 @@ new file mode 100644
 +		}
 +		if c != nil {
 +			ev.ApiId = c.ApiId
-+			if kind == "Response sent" {
++			if kind == "Request received" {
 +				ev.Pattern = c.FuncName
 +			}
 +		}
@@ -387,15 +396,16 @@ diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src
  	defer sc.sendServeMsg(http2handlerDoneMsg)
  	didPanic := true
  	defer func() {
-@@ -6940,6 +6946,11 @@
+@@ -6940,6 +6946,12 @@
  	if rws == nil {
  		panic("WriteHeader called after Handler finished")
  	}
++	// No caller identification: see conftamerLog.
 +	conftamerLog("Response sent", map[string]string{
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   rws.req.Method,
 +		"req.URL.Path": rws.req.URL.Path,
-+	}, rws.req.Context(), nil, true, nil)
++	}, rws.req.Context(), nil, false, nil)
  	rws.writeHeader(code)
  }
 
@@ -411,20 +421,21 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
  	req.RemoteAddr = c.remoteAddr
  	req.TLS = c.tlsState
  	if body, ok := req.Body.(*body); ok {
-@@ -1159,6 +1159,12 @@
+@@ -1159,6 +1159,13 @@
  	}
  	checkWriteHeaderCode(code)
 
++	// No caller identification: see conftamerLog.
 +	conftamerLog("Response sent", map[string]string{
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   w.req.Method,
 +		"req.URL.Path": w.req.URL.Path,
-+	}, w.req.Context(), nil, true, nil)
++	}, w.req.Context(), nil, false, nil)
 +
  	if code < 101 || code > 199 {
  		// Sending a 100 Continue or any non-1xx header disables the
  		// automatically-sent 100 Continue from Request.Body.Read.
-@@ -3308,6 +3314,12 @@
+@@ -3308,6 +3315,12 @@
  		handler = globalOptionsHandler{}
  	}
 

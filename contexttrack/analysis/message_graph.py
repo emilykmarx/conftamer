@@ -27,22 +27,46 @@ def _normalize_key(k: str) -> str:
     return _PREFIXES.sub("req.", k)
 
 
+def _req_identity(ev: dict) -> tuple | None:
+    """(method, path) of the request an event concerns, or None if absent."""
+    fields = {_normalize_key(k): v for k, v in ev.get("message", {}).items()}
+    method, path = fields.get("req.Method"), fields.get("req.URL.Path")
+    return (method, path) if method and path else None
+
+
+def _attribute_response(ev: dict, group: tuple, open_requests: dict) -> None:
+    """Attribute a "Response sent" event to the request it (likely) answers.
+    Copy that request's api_id/pattern into the response event.
+    """
+    ident = _req_identity(ev)
+    if ident is None:
+        return
+    kind = ev.get("kind", "")
+    if kind == "Request received":
+        open_requests[(group, ident)] = ev
+    elif kind == "Response sent":
+        req = open_requests.get((group, ident))
+        if req is None:
+            return
+        # Absent if caller identification failed for the request, e.g. it was
+        # served by an http.ServeMux rather than an application handler.
+        for field in ("api_id", "pattern"):
+            if req.get(field):
+                ev[field] = req[field]
+
+
 def _new_key(ev: dict) -> tuple | None:
     """API-level node key for events carrying api_id (from the Go tracer's
     caller-identification: the org that owns the code invoking the HTTP
     library, found by backtracing past protocol-agnostic HTTP-layer frames).
-    "Request sent" events key off (kind, api_id, method, path); "Response
-    sent" events key off (kind, api_id, pattern, method, path, code), where
-    pattern is the name of the handler frame that produced the response and
-    method/path/code identify the request/response.
-    request_id.host is deliberately excluded from the key — it's frequently
-    an ephemeral test-server port that would fragment otherwise-identical
-    nodes across runs.
+    "Request" events key off (kind, api_id, method, path); "Response" events
+    key off (kind, api_id, pattern, method, path, code), where 'code' comes
+    from the response and everything else from the request it answers.
 
     Returns None if this event doesn't carry the new fields, so the caller
-    falls back to the legacy _msg_key() logic (older trace files, or
-    "Request received"/"Response received" kinds, which this key doesn't
-    cover).
+    falls back to the legacy _msg_key() logic (older trace files, responses
+    that matched no request, or "Request received"/"Response received" kinds,
+    which this key doesn't cover).
     """
     kind = ev.get("kind", "")
     api_id = ev.get("api_id")
@@ -137,12 +161,16 @@ def main() -> None:
     groups_seen: dict[tuple, set] = defaultdict(set)
     # message key -> one representative event (for labelling)
     msg_rep: dict[tuple, dict] = {}
+    # (group, (method, path)) -> most recent "Request received" with that identity,
+    # used to attribute each response back to the request it answers
+    open_requests: dict[tuple, dict] = {}
 
     for ev in load_events(args.file):
         context_id = ev.get("context", {}).get("context_id")
         if not context_id or "message" not in ev:
             continue
         context_id = (ev.get("pid"), context_id)
+        _attribute_response(ev, context_id, open_requests)
         key = _msg_key(ev)
         if key not in groups_seen[context_id]:
             groups_seen[context_id].add(key)
