@@ -29,6 +29,27 @@ chain to a shared root heap address; it's no longer used (false positives
 from heap-address reuse, more vulnerable to custom types) but is preserved as
 [`go-inlibrary-optional.patch`](go-inlibrary-optional.patch).
 
+### Modify Prometheus' `common` (Prometheus only)
+
+`net/http`'s hooks only see `http.ServeMux` routing. Prometheus routes its real endpoints with `prometheus/common/route` (wrapping `julienschmidt/httprouter`).
+Without this its API events get a very coarse mount point (e.g., `pattern: /api/v1/` vs. `/api/v1/query`).
+
+Apply [`prometheus-common-route.patch`](prometheus-common-route.patch) to a writable copy of the module:
+
+```bash
+cp -r ~/go/pkg/mod/github.com/prometheus/common@v0.69.0 ~/common-conftamer
+chmod -R u+w ~/common-conftamer
+cd ~/common-conftamer && patch -p4 < ~/conftamer/contexttrack/prometheus-common-route.patch
+```
+
+Then point Prometheus at it, in `~/prometheus-src/go.mod`:
+
+```
+replace github.com/prometheus/common => /path/to/common-conftamer
+```
+
+The fork calls `http.ConftamerLogRouted`, exported from the patched `net/http`.
+
 ### Set Environment Variables
 
 - **`GOTOOLCHAIN=local`** — Without it, Go's `auto` toolchain may download
@@ -53,8 +74,9 @@ Each line looks something like this:
 ```
 
 Kinds are `Request sent`, `Request received`, `Response sent`, `Response received`, plus
-`Request routed` (emitted once per `http.ServeMux` match and used to find the most
-specific `pattern` that corresponds to a request).
+`Request routed` (used to find the most specific `pattern` that corresponds to a
+request). Patterns therefore appear in both routers' syntaxes: `{name}` from ServeMux,
+`:name` and `*path` from httprouter.
 
 Use `analysis/group_by_context.py` to see context groups and `analysis/message_graph.py`
 to generate the full, directed grah.

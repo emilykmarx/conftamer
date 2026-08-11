@@ -44,7 +44,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,355 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -391,6 +391,14 @@ new file mode 100644
 +		"req.Method":   r.Method,
 +		"req.URL.Path": r.URL.Path,
 +	}, r.Context(), nil, false, nil)
++}
++
++// ConftamerLogRouted records a route pattern matched by a router outside this
++// package — see conftamerLogRouted. Exported because a router such as
++// prometheus/common/route does its own matching, and can reach neither the
++// unexported logger nor the context ID it correlates on.
++func ConftamerLogRouted(pattern string, r *Request) {
++	conftamerLogRouted(pattern, r)
 +}
 diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
 --- a/usr/local/go/src/net/http/h2_bundle.go
