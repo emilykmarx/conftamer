@@ -9,7 +9,7 @@ diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/ne
  	"strings"
  	"sync"
  	"sync/atomic"
-@@ -607,6 +608,15 @@
+@@ -607,6 +608,16 @@
  	}
  	_ = *c // panic early if c is nil; see go.dev/issue/53521
 
@@ -17,15 +17,16 @@ diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/ne
 +	// to create a join key for later "response received."
 +	// Note: every HTTP request runs through `do` before being sent, but this should
 +	// be considered a fallback; ideally, the request context is created or inherited
-+	// at an earlier point. This doesn't mutate the caller's request object.
++	// at an earlier point. Stamped in place rather than onto a copy, so that the
++	// caller's own request — and anything derived from it later — carries the ID.
 +	if conftamerOn() {
-+		req = req.WithContext(conftamerStampID(req.Context()))
++		req.ctx = conftamerStampID(req.Context())
 +	}
 +
  	var (
  		deadline      = c.deadline()
  		reqs          []*Request
-@@ -739,6 +749,14 @@
+@@ -739,6 +750,14 @@
  			return nil, uerr(err)
  		}
 
