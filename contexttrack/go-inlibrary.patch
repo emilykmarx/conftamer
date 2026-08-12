@@ -45,7 +45,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,392 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -531,12 +531,10 @@ diff --git a/usr/local/go/src/net/http/transport.go b/home/tcr6/go-conftamer/src
  		req.closeBody()
  		return nil, errors.New("http: nil Request.Header")
 @@ -2519,6 +2525,9 @@
- 		if err != nil {
- 			return
- 		}
-+		// Not inside ReadResponse: it's exported, and callers may point it at
-+		// any reader (parsing a cached response isn't a socket read).
+		if err != nil {
+			return
+		}
 +		conftamerLogResponseWire("Response received", resp.StatusCode, nil, rc.treq.Request)
- 		resCode := resp.StatusCode
- 		if continueCh != nil && resCode == StatusContinue {
- 			if trace != nil && trace.Got100Continue != nil {
+		resCode := resp.StatusCode
+		if continueCh != nil && resCode == StatusContinue {
+			if trace != nil && trace.Got100Continue != nil {
