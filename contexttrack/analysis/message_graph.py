@@ -22,7 +22,7 @@ from event_io import load_events
 
 # message fields recorded for debugging but
 # shouldn't go into node identity/labels
-_EXCLUDE_KEYS = {"req.URL.RawQuery"}
+_EXCLUDE_KEYS = {"req.URL.RawQuery", "req.URL.Host"}
 
 
 def _req_identity(ev: dict) -> tuple | None:
@@ -252,15 +252,7 @@ def main() -> None:
                         help="Output format (default: text)")
     parser.add_argument("--recv-sent", action="store_true",
                         help="Only draw edges from a received message to a later sent message")
-    parser.add_argument("--include-host", action="store_true",
-                        help="Include URL.Host in node identity/labels (excluded by default, "
-                             "since two otherwise-identical messages sent to different hosts "
-                             "would otherwise be treated as distinct nodes)")
     args = parser.parse_args()
-
-    global _EXCLUDE_KEYS
-    if not args.include_host:
-        _EXCLUDE_KEYS.add("req.URL.Host")
 
     # (pid, context_id) -> list of (key, kind) in arrival order
     groups: dict[tuple, list] = defaultdict(list)
