@@ -1,0 +1,5 @@
+module_path: /home/emily/projects/config_tracing/prometheus
+module_prefix: github.com/prometheus/prometheus
+results_path: /home/emily/projects/config_tracing/golang.org-x-tools/gopls/results/prom/tmp
+gopls_path: /home/emily/projects/config_tracing/golang.org-x-tools/gopls
+unmarshaler_subgraph: unmarshaler_subgraph.text
