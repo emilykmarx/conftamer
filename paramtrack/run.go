@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 func CheckCmd(out []byte, err error) {
@@ -20,6 +21,7 @@ func main() {
 	flag.Parse()
 
 	config, err := LoadConfig(config_file)
+	config.Unmarshaler_subgraph = filepath.Join(config.Results_path, config.Unmarshaler_subgraph)
 	CheckCmd(nil, err)
 
 	// Setup
@@ -41,6 +43,7 @@ func main() {
 	}
 	if config.Accessors != "" {
 		// Find Accessors too
+		config.Accessors = filepath.Join(config.Results_path, config.Accessors)
 		gopls_cmd = append(gopls_cmd, "-a-out", config.Accessors)
 	}
 
