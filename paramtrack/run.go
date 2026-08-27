@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 )
 
 func CheckCmd(out []byte, err error) {
@@ -21,11 +20,10 @@ func main() {
 	flag.Parse()
 
 	config, err := LoadConfig(config_file)
-	config.Unmarshaler_subgraph = filepath.Join(config.Results_path, config.Unmarshaler_subgraph)
 	CheckCmd(nil, err)
 
 	// Setup
-	out, err := exec.Command("mkdir", "-p", config.Results_path).CombinedOutput()
+	out, err := exec.Command("mkdir", "-p", config.Output_path).CombinedOutput()
 	CheckCmd(out, err)
 
 	err = os.Chdir(config.Gopls_path)
@@ -36,16 +34,15 @@ func main() {
 	// Find Unmarshaler Subgraph, and optionally Accessors
 	err = os.Chdir(config.Module_path)
 	CheckCmd(nil, err)
-	gopls_cmd := []string{"--", "conftamer",
-		"-u-defn", config.Unmarshal_fn,
-		"-m", config.Module_prefix,
-		"-u-out", config.Unmarshaler_subgraph,
+	gopls_cmd := []string{"conftamer",
+		"-module_prefix=" + config.Module_prefix,
+		"-unmarshal_fn=" + config.Unmarshal_fn,
+		"-unmarshal_iface=" + config.Unmarshal_iface,
+		"-find_accessors=" + config.Find_accessors,
+		"-output_path=" + config.Output_path,
 	}
-	if config.Accessors != "" {
-		// Find Accessors too
-		config.Accessors = filepath.Join(config.Results_path, config.Accessors)
-		gopls_cmd = append(gopls_cmd, "-a-out", config.Accessors)
-	}
+
+	fmt.Println(gopls_cmd)
 
 	gopls := exec.Command(config.Gopls_path+"/gopls", gopls_cmd...)
 	// get live results

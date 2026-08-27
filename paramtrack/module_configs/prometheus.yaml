@@ -1,5 +1,9 @@
-module_path: /home/emily/projects/config_tracing/prometheus
 module_prefix: github.com/prometheus/prometheus
-results_path: /home/emily/projects/config_tracing/golang.org-x-tools/gopls/results/prom/tmp
+# Uncomment one of these to change the strategy used to find Unmarshalers
+#unmarshal_fn: /home/emily/go/pkg/mod/gopkg.in/yaml.v2@v2.4.0/yaml.go:88:6 # func UnmarshalStrict
+#unmarshal_iface: /home/emily/go/pkg/mod/gopkg.in/yaml.v2@v2.4.0/yaml.go:32:6 # UnmarshalYAML interface
+
+output_path: /home/emily/projects/config_tracing/golang.org-x-tools/gopls/results/prom/tmp
+find_accessors: false
+module_path: /home/emily/projects/config_tracing/prometheus
 gopls_path: /home/emily/projects/config_tracing/golang.org-x-tools/gopls
-unmarshaler_subgraph: unmarshaler_subgraph.text
