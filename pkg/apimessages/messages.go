@@ -3,6 +3,7 @@ package apimessages
 import (
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 
@@ -22,6 +23,11 @@ type APICallID struct {
 	Verb           string
 	Resource       string
 	APIMessageType string
+}
+
+func (api_call_id APICallID) String() string {
+	// assume resource already has a / prefix
+	return fmt.Sprintf("%v-%v%v", api_call_id.API, api_call_id.Verb, api_call_id.Resource)
 }
 
 // Whether the message is a request or response
