@@ -1,0 +1,22 @@
+# ConfTamer: log Grafana's pkg/web (Macaron-derived) router matches as "Request routed".
+# Applies to the Grafana repo root (made against v13.1.0) (patch -p1).
+# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted).
+
+--- a/pkg/web/router.go
++++ b/pkg/web/router.go
+@@ -104,6 +104,15 @@
+ 		return
+ 	}
+ 
++	// ConfTamer: pattern is the full registered route (group prefixes
++	// included), e.g. /api/dashboards/uid/:uid. Wrapping the handle here covers
++	// both the static fast path and the tree match in ServeHTTP.
++	routed := handle
++	handle = func(resp http.ResponseWriter, req *http.Request, params map[string]string) {
++		http.ConftamerLogRouted(pattern, req)
++		routed(resp, req, params)
++	}
++
+ 	// Validate HTTP methods.
+ 	if !_HTTP_METHODS[method] && method != "*" {
+ 		panic("unknown HTTP method: " + method)

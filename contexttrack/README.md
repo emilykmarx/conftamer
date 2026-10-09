@@ -50,6 +50,14 @@ replace github.com/prometheus/common => /path/to/common-conftamer
 
 The fork calls `http.ConftamerLogRouted`, exported from the patched `net/http`.
 
+### Other routers
+
+The same kind of hook for other routers, as patches with paths relative to the module root (`git apply`/`patch -p1`):
+- [`go-restful-route.patch`](go-restful-route.patch)
+- [`k8s-pathrecorder-route.patch`](k8s-pathrecorder-route.patch)
+- [`gorilla-mux-route.patch`](gorilla-mux-route.patch)
+- [`grafana-web-route.patch`](grafana-web-route.patch)
+
 ### Set Environment Variables
 
 - **`GOTOOLCHAIN=local`** — Without it, Go's `auto` toolchain may download
@@ -74,9 +82,8 @@ Each line looks something like this:
 ```
 
 Kinds are `Request sent`, `Request received`, `Response sent`, `Response received`, plus
-`Request routed` (used to find the most specific `pattern` that corresponds to a
-request). Patterns therefore appear in both routers' syntaxes: `{name}` from ServeMux,
-`:name` and `*path` from httprouter.
+`Request routed` (used to find the most specific routed `pattern` that corresponds to a
+request; see [router patches](#other-routers)).
 
 `Request sent` events also carry `call_chain`.
 

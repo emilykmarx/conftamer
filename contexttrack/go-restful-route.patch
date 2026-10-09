@@ -1,0 +1,17 @@
+# ConfTamer: log go-restful's route selection as "Request routed".
+# Applies to github.com/emicklei/go-restful/v3 (made against v3.11.0); paths are relative to the module root (patch -p1).
+# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted).
+
+--- a/container.go
++++ b/container.go
+@@ -251,6 +251,10 @@
+ 		chain.ProcessFilter(NewRequest(httpRequest), NewResponse(writer))
+ 		return
+ 	}
++	// ConfTamer: route.Path is the matched route's template (webservice root
++	// path + route path, e.g. /api/v1/namespaces/{namespace}/pods). Logged
++	// before filters and dispatch, as net/http's ServeMux does.
++	http.ConftamerLogRouted(route.Path, httpRequest)
+ 
+ 	// Unless httpWriter is already an CompressingResponseWriter see if we need to install one
+ 	if _, isCompressing := httpWriter.(*CompressingResponseWriter); !isCompressing {

@@ -1,0 +1,24 @@
+# ConfTamer: log k8s.io/apiserver's PathRecorderMux matches as "Request routed".
+# Applies to k8s.io/apiserver (made against v0.31.1, i.e. Kubernetes v1.31.1's staging/src/k8s.io/apiserver); paths are relative to the module root (patch -p1).
+# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted).
+
+--- a/pkg/server/mux/pathrecorder.go
++++ b/pkg/server/mux/pathrecorder.go
+@@ -241,6 +241,8 @@
+ func (h *pathHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	if exactHandler, ok := h.pathToHandler[r.URL.Path]; ok {
+ 		klog.V(5).Infof("%v: %q satisfied by exact match", h.muxName, r.URL.Path)
++		// ConfTamer: exact match, so the path is the pattern.
++		http.ConftamerLogRouted(r.URL.Path, r)
+ 		exactHandler.ServeHTTP(w, r)
+ 		return
+ 	}
+@@ -248,6 +250,8 @@
+ 	for _, prefixHandler := range h.prefixHandlers {
+ 		if strings.HasPrefix(r.URL.Path, prefixHandler.prefix) {
+ 			klog.V(5).Infof("%v: %q satisfied by prefix %v", h.muxName, r.URL.Path, prefixHandler.prefix)
++			// ConfTamer: prefix match (ends in "/", as in ServeMux patterns).
++			http.ConftamerLogRouted(prefixHandler.prefix, r)
+ 			prefixHandler.handler.ServeHTTP(w, r)
+ 			return
+ 		}
