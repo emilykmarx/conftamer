@@ -78,6 +78,8 @@ Kinds are `Request sent`, `Request received`, `Response sent`, `Response receive
 request). Patterns therefore appear in both routers' syntaxes: `{name}` from ServeMux,
 `:name` and `*path` from httprouter.
 
+`Request sent` events also carry `call_chain`.
+
 Use `analysis/group_by_context.py` to see context groups and `analysis/message_graph.py`
 to generate the full, directed grah.
 

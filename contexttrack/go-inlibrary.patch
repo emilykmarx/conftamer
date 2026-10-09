@@ -45,7 +45,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,416 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -128,6 +128,15 @@ new file mode 100644
 +	// Handler is the name of the Handler serving a "Request received" event.
 +	// Not set on "Response sent".
 +	Handler string `json:"handler,omitempty"`
++	// CallChain is the full stack at a "Request sent" event, innermost frame first,
++	// starting at the net/http function that logged it.
++	CallChain []conftamerFrame `json:"call_chain,omitempty"`
++}
++
++type conftamerFrame struct {
++	Function string `json:"function"`
++	File     string `json:"file"`
++	Line     int    `json:"line"`
 +}
 +
 +type conftamerRequestID struct {
@@ -317,6 +326,32 @@ new file mode 100644
 +	return 0
 +}
 +
++// conftamerCallChain returns every frame of the current goroutine's stack, innermost
++// first, skipping `skip` frames above its caller (0 = start at the caller).
++// The buffer grows until the whole stack fits, so deep stacks aren't truncated.
++func conftamerCallChain(skip int) []conftamerFrame {
++	pcs := make([]uintptr, 64)
++	var n int
++	for {
++		// +2 skips runtime.Callers and conftamerCallChain itself
++		n = runtime.Callers(skip+2, pcs)
++		if n < len(pcs) {
++			break
++		}
++		pcs = make([]uintptr, 2*len(pcs))
++	}
++	chain := make([]conftamerFrame, 0, n)
++	frames := runtime.CallersFrames(pcs[:n])
++	for {
++		f, more := frames.Next()
++		chain = append(chain, conftamerFrame{Function: f.Function, File: f.File, Line: f.Line})
++		if !more {
++			break
++		}
++	}
++	return chain
++}
++
 +// --- logging entry point -----------------------------------------------
 +
 +// conftamerLog records one HTTP event. ctx is the context with ID used for correlation.
@@ -365,6 +400,8 @@ new file mode 100644
 +	}
 +	if kind == "Request sent" {
 +		ev.RequestID = reqID
++		// Skip conftamerLog, so the chain starts at the hook site (Transport.roundTrip)
++		ev.CallChain = conftamerCallChain(1)
 +	}
 +
 +	linebytes, err := json.Marshal(ev)
