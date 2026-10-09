@@ -17,7 +17,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from event_io import load_events
+from event_io import dedup_responses, load_events
 
 
 # message fields recorded for debugging but
@@ -268,7 +268,7 @@ def main() -> None:
     open_requests: dict[tuple, dict] = {}
 
     # Read in full so routes can be resolved before any event is keyed
-    events = list(load_events(args.file))
+    events = dedup_responses(list(load_events(args.file)))
     _stamp_routes(events)
 
     for ev in events:

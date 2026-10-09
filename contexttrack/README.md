@@ -87,8 +87,12 @@ request; see [router patches](#other-routers)).
 
 `Request sent` events also carry `call_chain`.
 
+A request sent through `http.Client` produces two `Response received` events (one from
+the transport read loop, one from `Client.do`); both analysis scripts deduplicate, keeping
+`Client.do` (contains `api_id`) if available.
+
 Use `analysis/group_by_context.py` to see context groups and `analysis/message_graph.py`
-to generate the full, directed grah.
+to generate the full graph.
 
 # Running Tests
 

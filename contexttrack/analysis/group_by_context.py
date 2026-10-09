@@ -10,7 +10,7 @@ import json
 import sys
 from collections import defaultdict
 
-from event_io import load_events
+from event_io import dedup_responses, load_events
 
 
 # message identifier
@@ -19,7 +19,6 @@ from event_io import load_events
 _KIND_LABEL = {
     "Request sent":      ">> req sent   ",
     "Request received":  "<< req recvd  ",
-    "Request routed":    "-- req routed ",
     "Response sent":     ">> resp sent  ",
     "Response received": "<< resp recvd ",
 }
@@ -33,13 +32,6 @@ def _ident(event: dict) -> tuple:
     if kind in ("Request sent", "Request received"):
         verb = msg.get("req.Method", "?")
         path = msg.get("req.URL.Path", "/")
-        code = ""
-
-    elif kind == "Request routed":
-        # Shows the route pattern matched rather than the concrete path. No verb:
-        # a Go 1.22+ pattern already carries the method ("GET /items/{id}").
-        verb = ""
-        path = msg.get("pattern", "?")
         code = ""
 
     elif kind == "Response sent":
@@ -63,7 +55,6 @@ def _ident(event: dict) -> tuple:
 _KIND_LABEL_CLEAN = {
     ">> req sent   ":  "req sent",
     "<< req recvd  ":  "req recvd",
-    "-- req routed ":  "req routed",
     ">> resp sent  ":  "resp sent",
     "<< resp recvd ":  "resp recvd",
 }
@@ -112,7 +103,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    events = list(load_events(args.input))
+    # "Request routed" events aren't messages; message_graph.py uses them only to
+    # label received requests with route patterns, so they're dropped here.
+    events = [ev for ev in dedup_responses(list(load_events(args.input)))
+              if ev.get("kind") != "Request routed"]
 
     if not events:
         sys.exit("No events found.")
