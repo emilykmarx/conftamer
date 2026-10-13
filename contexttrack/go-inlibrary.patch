@@ -45,7 +45,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,446 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -125,7 +125,8 @@ new file mode 100644
 +	Context     *conftamerContextInfo `json:"context"`
 +	RequestID   *conftamerRequestID   `json:"request_id,omitempty"`
 +	ApiId       string                `json:"api_id,omitempty"`
-+	// Handler is the name of the Handler serving a "Request received" event.
++	// Handler is the name of the Handler serving a "Request received" event, or
++	// the Handler a ServeMux routed a "Request routed" event to.
 +	// Not set on "Response sent".
 +	Handler string `json:"handler,omitempty"`
 +	// CallChain is the full stack at a "Request sent" event, innermost frame first,
@@ -203,9 +204,29 @@ new file mode 100644
 +
 +// --- caller (API_ID) identification ----------------------
 +
++// Generic HTTP plumbing (client wrappers, routers) that can't identify the API.
++// true: also skip subpackages and major versions (e.g. go-restful/v3).
 +var conftamerHTTPLayerPackages = map[string]bool{
-+	"net/http":               true,
-+	"golang.org/x/net/http2": true,
++	"net/http":                         false,
++	"net/http/httputil":                false,
++	"golang.org/x/net/http2":           false,
++	"golang.org/x/oauth2":              true,
++	"golang.org/x/net/context/ctxhttp": true,
++	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp": true,
++	"github.com/prometheus/common/route":                            true,
++	"github.com/emicklei/go-restful":                                true,
++	"github.com/gorilla/mux":                                        true,
++	"k8s.io/apiserver/pkg/server/mux":                               true,
++	"github.com/grafana/grafana/pkg/web":                            true,
++}
++
++func conftamerIsHTTPLayer(pkg string) bool {
++	for p, subpkgs := range conftamerHTTPLayerPackages {
++		if pkg == p || subpkgs && strings.HasPrefix(pkg, p+"/") {
++			return true
++		}
++	}
++	return false
 +}
 +
 +var conftamerMultiTenantHosts = map[string]bool{
@@ -271,7 +292,7 @@ new file mode 100644
 +	for {
 +		f, more := frames.Next()
 +		pkg := conftamerPackageName(f.Function)
-+		if pkg != "" && !conftamerHTTPLayerPackages[pkg] {
++		if pkg != "" && !conftamerIsHTTPLayer(pkg) {
 +			return &conftamerCaller{FuncName: f.Function, Package: pkg, ApiId: conftamerApiID(pkg)}
 +		}
 +		if !more {
@@ -306,7 +327,7 @@ new file mode 100644
 +		pkg = t.PkgPath()
 +		name = t.String()
 +	}
-+	if pkg == "" || conftamerHTTPLayerPackages[pkg] {
++	if pkg == "" || conftamerIsHTTPLayer(pkg) {
 +		return nil
 +	}
 +	return &conftamerCaller{FuncName: name, Package: pkg, ApiId: conftamerApiID(pkg)}
@@ -356,9 +377,10 @@ new file mode 100644
 +
 +// conftamerLog records one HTTP event. ctx is the context with ID used for correlation.
 +// reqID (may be nil) is set for "Request sent". withCaller enables caller identification.
-+// handler (non-nil only for "Request received") is the not-yet-invoked Handler about to
-+// serve the request — when set, it's used instead of a stack walk, since the application
-+// handler isn't on the stack yet at that log point, and its name is recorded as Handler.
++// handler (non-nil only for "Request received" and "Request routed") is the not-yet-invoked
++// Handler about to serve the request — when set, it's used instead of a stack walk, since
++// the application handler isn't on the stack yet at that log point, and its name is
++// recorded as Handler.
 +//
 +// "Response sent" deliberately does NOT identify a caller: at the point a response is
 +// written, the stack holds whatever the handler last called (fmt.Fprintln,
@@ -393,7 +415,7 @@ new file mode 100644
 +		}
 +		if c != nil {
 +			ev.ApiId = c.ApiId
-+			if kind == "Request received" {
++			if handler != nil {
 +				ev.Handler = c.FuncName
 +			}
 +		}
@@ -420,7 +442,13 @@ new file mode 100644
 +// ResponseWriter's request never sees. Nested muxes each log, sharing the request's
 +// context ID, so the last one recorded is the innermost — the most specific match.
 +// An empty pattern (no route matched) is not logged.
-+func conftamerLogRouted(pattern string, r *Request) {
++//
++// handler (may be nil) is what the pattern routes to: a Handler, or a router's own
++// handler type (any func or value works). When set, the API ID is identified from it,
++// as for "Request received": a server whose top-level Handler is a ServeMux gets no
++// API ID there (net/http is an HTTP-layer package), but the handler the mux
++// dispatches to is the application's.
++func conftamerLogRouted(pattern string, r *Request, handler any) {
 +	if pattern == "" {
 +		return
 +	}
@@ -428,15 +456,17 @@ new file mode 100644
 +		"pattern":      pattern,
 +		"req.Method":   r.Method,
 +		"req.URL.Path": r.URL.Path,
-+	}, r.Context(), nil, false, nil)
++	}, r.Context(), nil, handler != nil, handler)
 +}
 +
 +// ConftamerLogRouted records a route pattern matched by a router outside this
 +// package — see conftamerLogRouted. Exported because a router such as
 +// prometheus/common/route does its own matching, and can reach neither the
 +// unexported logger nor the context ID it correlates on.
-+func ConftamerLogRouted(pattern string, r *Request) {
-+	conftamerLogRouted(pattern, r)
++// handler should be the application's handler for the route, not a wrapper the
++// router adds around it (middleware, instrumentation), so the API ID names the app.
++func ConftamerLogRouted(pattern string, r *Request, handler any) {
++	conftamerLogRouted(pattern, r, handler)
 +}
 +
 +// Response received; as close as possible to socket.
@@ -531,10 +561,10 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
 -		h, _ = mux.mux121.findHandler(r)
 +		var pat121 string
 +		h, pat121 = mux.mux121.findHandler(r)
-+		conftamerLogRouted(pat121, r)
++		conftamerLogRouted(pat121, r, h)
  	} else {
  		h, r.Pattern, r.pat, r.matches = mux.findHandler(r)
-+		conftamerLogRouted(r.Pattern, r)
++		conftamerLogRouted(r.Pattern, r, h)
  	}
  	h.ServeHTTP(w, r)
  }

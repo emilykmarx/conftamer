@@ -48,7 +48,8 @@ Then point Prometheus at it, in `~/prometheus-src/go.mod`:
 replace github.com/prometheus/common => /path/to/common-conftamer
 ```
 
-The fork calls `http.ConftamerLogRouted`, exported from the patched `net/http`.
+The fork calls `http.ConftamerLogRouted(pattern, req, handler)`, exported from the patched `net/http`.
+Handler: the application's handler for the matched route, ideally ID'd from the last "routed" message.
 
 ### Other routers
 
