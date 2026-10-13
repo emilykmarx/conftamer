@@ -1,0 +1,71 @@
+# ConfTamer: log Caddy's route matching (caddyhttp routes and their matchers) as "Request routed".
+# Applies to github.com/caddyserver/caddy/v2 (made against v2.7.5; also applies to v2.8-v2.11); paths are relative to the module root (patch -p1).
+# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted, with its handler argument).
+
+--- a/modules/caddyhttp/routes.go
++++ b/modules/caddyhttp/routes.go
+@@ -283,6 +283,18 @@
+ 				groups[route.Group] = struct{}{}
+ 			}
+ 
++			// ConfTamer: this route applies to the request. Its "pattern" is
++			// its matchers (see conftamerRoutePattern, conftamer.go), and the
++			// handler it routes to is its last one (e.g. reverse_proxy's), so
++			// the API ID names that. Logged before the route's handlers run, as
++			// net/http's ServeMux does; nested routes (subroute) log after their
++			// parent.
++			var conftamerHandler any
++			if n := len(route.Handlers); n > 0 {
++				conftamerHandler = route.Handlers[n-1]
++			}
++			http.ConftamerLogRouted(conftamerRoutePattern(route.MatcherSets), req, conftamerHandler)
++
+ 			// make terminal routes terminate
+ 			if route.Terminal {
+ 				if _, ok := req.Context().Value(ErrorCtxKey).(error); ok {
+--- /dev/null
++++ b/modules/caddyhttp/conftamer.go
+@@ -0,0 +1,43 @@
++// ConfTamer: helpers for the "Request routed" hook in routes.go (wrapRoute).
++
++package caddyhttp
++
++import (
++	"encoding/json"
++	"fmt"
++	"strings"
++
++	"github.com/caddyserver/caddy/v2"
++)
++
++// conftamerRoutePattern describes a route's matchers as a pattern for
++// http.ConftamerLogRouted: each matcher as <module name>=<its JSON config>
++// (e.g. path=["/api/*"]), matchers in a set joined by " && ", and sets by
++// " || ". A route without matchers matches everything: "*". (The matchers'
++// raw JSON is cleared once they're loaded, so this re-marshals them.)
++func conftamerRoutePattern(sets MatcherSets) string {
++	if len(sets) == 0 {
++		return "*"
++	}
++	var b strings.Builder
++	for i, set := range sets {
++		if i > 0 {
++			b.WriteString(" || ")
++		}
++		for j, m := range set {
++			if j > 0 {
++				b.WriteString(" && ")
++			}
++			name := fmt.Sprintf("%T", m)
++			if mod, ok := m.(caddy.Module); ok {
++				name = mod.CaddyModule().ID.Name()
++			}
++			b.WriteString(name)
++			if cfg, err := json.Marshal(m); err == nil {
++				b.WriteByte('=')
++				b.Write(cfg)
++			}
++		}
++	}
++	return b.String()
++}

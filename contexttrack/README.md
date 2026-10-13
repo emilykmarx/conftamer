@@ -58,6 +58,8 @@ The same kind of hook for other routers, as patches with paths relative to the m
 - [`k8s-pathrecorder-route.patch`](k8s-pathrecorder-route.patch)
 - [`gorilla-mux-route.patch`](gorilla-mux-route.patch)
 - [`grafana-web-route.patch`](grafana-web-route.patch)
+- [`caddy-route.patch`](caddy-route.patch): Caddy's route matching (`caddyhttp` routes). The pattern is the
+  route's matchers, e.g. `path=["/api/*"]` (`&&` within a matcher set, `||` between sets, `*` for none).
 
 ### Set Environment Variables
 
