@@ -1,14 +1,21 @@
 diff --git a/home/tcr6/go/pkg/mod/github.com/prometheus/common@v0.69.0/route/route.go b/home/tcr6/common-conftamer/route/route.go
 --- a/home/tcr6/go/pkg/mod/github.com/prometheus/common@v0.69.0/route/route.go
 +++ b/home/tcr6/common-conftamer/route/route.go
-@@ -74,6 +74,11 @@
+@@ -69,11 +69,18 @@
+
+ // handle turns a HandlerFunc into an httprouter.Handle.
+ func (r *Router) handle(handlerName string, h http.HandlerFunc) httprouter.Handle {
++	// ConfTamer: the application's handler, before instrumentation wraps it
++	appHandler := h
+ 	if r.instrh != nil {
+ 		// This needs to be outside the closure to avoid data race when reading and writing to 'h'.
  		h = r.instrh(handlerName, h)
  	}
  	return func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
 +		// ConfTamer: httprouter matched req.URL.Path against r.prefix+handlerName
 +		// (see the registrars below), so that string is this request's route
 +		// pattern. Logged before dispatch, as net/http's ServeMux does.
-+		http.ConftamerLogRouted(r.prefix+handlerName, req)
++		http.ConftamerLogRouted(r.prefix+handlerName, req, appHandler)
 +
  		ctx, cancel := context.WithCancel(req.Context())
  		defer cancel()

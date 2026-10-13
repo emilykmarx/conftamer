@@ -40,7 +40,8 @@ def _response_site(ev: dict) -> str | None:
     """
     if ev.get("kind") != "Response received":
         return None
-    file = ev.get("file", "")
+    # Binaries built with -trimpath record "net/http/x.go" with no leading "/"
+    file = "/" + ev.get("file", "")
     if file.endswith(("/net/http/conftamer.go", "/net/http/transport.go")):
         return "transport"
     if file.endswith("/net/http/client.go"):

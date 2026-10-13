@@ -1,18 +1,20 @@
 # ConfTamer: log gorilla/mux route matches as "Request routed".
 # Applies to github.com/gorilla/mux (made against v1.8.1); paths are relative to the module root (patch -p1).
-# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted).
+# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted, with its handler argument).
 
 --- a/mux.go
 +++ b/mux.go
-@@ -197,6 +197,12 @@
+@@ -197,6 +197,14 @@
  	var handler http.Handler
  	if r.Match(req, &match) {
  		handler = match.Handler
 +		// ConfTamer: the matched route's path template (for a subrouter's route,
 +		// including the parent's prefix), e.g. /loki/api/v1/query_range.
 +		// Routes matched on something other than a path have no template.
++		// match.Handler is wrapped in the router's middleware, so pass the
++		// route's own handler.
 +		if tpl, err := match.Route.GetPathTemplate(); err == nil && handler != nil {
-+			http.ConftamerLogRouted(tpl, req)
++			http.ConftamerLogRouted(tpl, req, match.Route.GetHandler())
 +		}
  		req = requestWithVars(req, match.Vars)
  		req = requestWithRoute(req, match.Route)

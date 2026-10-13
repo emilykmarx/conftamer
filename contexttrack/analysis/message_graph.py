@@ -111,7 +111,13 @@ def _stamp_routes(events: list[dict]) -> None:
             hops[key].append(ev)
 
     routes: dict[tuple, str] = {}
+    # API ID of the handler the innermost identifiable mux routed to.
+    # Prefer this over "Request Received" top-level handler
+    route_api_ids: dict[tuple, str] = {}
     for key, chain in hops.items():
+        api_ids = [hop["api_id"] for hop in chain if hop.get("api_id")]
+        if api_ids:
+            route_api_ids[key] = api_ids[-1]
         first, last = chain[0], chain[-1]
         # First message: original complete request path
         # Last message path: request path as seen by last mux
@@ -129,6 +135,9 @@ def _stamp_routes(events: list[dict]) -> None:
         key = _route_key(ev)
         if key is not None and key in routes:
             ev["route_pattern"] = routes[key]
+        # Responses take "API ID" from their request (_attribute_response)
+        if ev.get("kind") == "Request received" and key in route_api_ids:
+            ev["api_id"] = route_api_ids[key]
 
 def _attribute_response(ev: dict, group: tuple, open_requests: dict) -> None:
     """Attribute a "Response sent" event to the request it (likely) answers,

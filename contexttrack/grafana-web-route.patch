@@ -1,22 +1,25 @@
 # ConfTamer: log Grafana's pkg/web (Macaron-derived) router matches as "Request routed".
 # Applies to the Grafana repo root (made against v13.1.0) (patch -p1).
-# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted).
+# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted, with its handler argument).
 
 --- a/pkg/web/router.go
 +++ b/pkg/web/router.go
-@@ -104,6 +104,15 @@
- 		return
+@@ -147,7 +147,18 @@
+ 		handlers = h
  	}
  
-+	// ConfTamer: pattern is the full registered route (group prefixes
-+	// included), e.g. /api/dashboards/uid/:uid. Wrapping the handle here covers
-+	// both the static fast path and the tree match in ServeHTTP.
-+	routed := handle
-+	handle = func(resp http.ResponseWriter, req *http.Request, params map[string]string) {
-+		http.ConftamerLogRouted(pattern, req)
-+		routed(resp, req, params)
++	// ConfTamer: the application's handler is the last one; earlier ones are
++	// group middleware
++	var appHandler Handler
++	if len(handlers) > 0 {
++		appHandler = handlers[len(handlers)-1]
 +	}
-+
- 	// Validate HTTP methods.
- 	if !_HTTP_METHODS[method] && method != "*" {
- 		panic("unknown HTTP method: " + method)
+ 	r.handle(method, pattern, func(resp http.ResponseWriter, req *http.Request, params map[string]string) {
++		// ConfTamer: pattern is the full registered route (group prefixes
++		// included), e.g. /api/dashboards/uid/:uid. Logged here, inside the
++		// handle, to cover both the static fast path and the tree match in
++		// ServeHTTP.
++		http.ConftamerLogRouted(pattern, req, appHandler)
+ 		c := r.m.createContext(resp, SetURLParams(req, params))
+ 		for _, h := range handlers {
+ 			c.mws = append(c.mws, mwFromHandler(h))
