@@ -12,7 +12,7 @@ diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/ne
 @@ -607,6 +608,16 @@
  	}
  	_ = *c // panic early if c is nil; see go.dev/issue/53521
-
+ 
 +	// Create or inherit a request ID at the client origin (request sent)
 +	// to create a join key for later "response received."
 +	// Note: every HTTP request runs through `do` before being sent, but this should
@@ -29,7 +29,7 @@ diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/ne
 @@ -739,6 +750,14 @@
  			return nil, uerr(err)
  		}
-
+ 
 +		ireq := reqs[0]
 +		// resp.Status is not logged: it only restates resp.StatusCode.
 +		conftamerLog("Response received", map[string]string{
@@ -45,7 +45,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,544 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -60,6 +60,7 @@ new file mode 100644
 +	"context"
 +	"encoding/json"
 +	"fmt"
++	"net"
 +	"os"
 +	"reflect"
 +	"runtime"
@@ -67,6 +68,7 @@ new file mode 100644
 +	"strings"
 +	"sync"
 +	"sync/atomic"
++	"time"
 +)
 +
 +var (
@@ -116,6 +118,7 @@ new file mode 100644
 +
 +type conftamerEvent struct {
 +	Kind        string                `json:"kind"`
++	Ts          int64                 `json:"ts"` // Unix ns
 +	Pid         int                   `json:"pid"`
 +	GoroutineID int                   `json:"goroutine_id"`
 +	ThreadID    int                   `json:"thread_id"`
@@ -129,9 +132,21 @@ new file mode 100644
 +	// the Handler a ServeMux routed a "Request routed" event to.
 +	// Not set on "Response sent".
 +	Handler string `json:"handler,omitempty"`
-+	// CallChain is the full stack at a "Request sent" event, innermost frame first,
-+	// starting at the net/http function that logged it.
++	// CallChain is the full stack at the event, innermost frame first, starting
++	// at the function that logged it.
 +	CallChain []conftamerFrame `json:"call_chain,omitempty"`
++}
++
++// conftamerEnsureServerContext gives r a context ID, if it lacks one: a request
++// built by a server outside net/http without the ConftamerServerRequest hook.
++func conftamerEnsureServerContext(r *Request) *Request {
++	if !conftamerOn() {
++		return r
++	}
++	if _, ok := r.Context().Value(conftamerIDKey).(uint64); ok {
++		return r
++	}
++	return r.WithContext(conftamerStampID(r.Context()))
 +}
 +
 +type conftamerFrame struct {
@@ -218,6 +233,7 @@ new file mode 100644
 +	"github.com/gorilla/mux":                                        true,
 +	"k8s.io/apiserver/pkg/server/mux":                               true,
 +	"github.com/grafana/grafana/pkg/web":                            true,
++	"google.golang.org/grpc":                                        true,
 +}
 +
 +func conftamerIsHTTPLayer(pkg string) bool {
@@ -390,14 +406,21 @@ new file mode 100644
 +// each response back to the "Request received" it answers, and the matched route pattern
 +// from the "Request routed" events logged by conftamerLogRouted.
 +func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any) {
++	conftamerLogAt(2, time.Now(), kind, msg, ctx, reqID, withCaller, handler)
++}
++
++// conftamerLogAt is conftamerLog for an event that happened at ts, logged by
++// the function skip frames up (1: conftamerLogAt's caller).
++func conftamerLogAt(skip int, ts time.Time, kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any) {
 +	if !conftamerOn() {
 +		return
 +	}
 +
-+	_, file, line, _ := runtime.Caller(1)
++	_, file, line, _ := runtime.Caller(skip)
 +
 +	ev := conftamerEvent{
 +		Kind:        kind,
++		Ts:          ts.UnixNano(),
 +		Pid:         os.Getpid(),
 +		GoroutineID: conftamerGoID(),
 +		File:        file,
@@ -422,9 +445,10 @@ new file mode 100644
 +	}
 +	if kind == "Request sent" {
 +		ev.RequestID = reqID
-+		// Skip conftamerLog, so the chain starts at the hook site (Transport.roundTrip)
-+		ev.CallChain = conftamerCallChain(1)
 +	}
++	// Skip conftamerLog(At), so the chain starts at the function that logged
++	// the event (Transport.roundTrip, serverHandler.ServeHTTP, conftamerLogRouted, ...)
++	ev.CallChain = conftamerCallChain(skip)
 +
 +	linebytes, err := json.Marshal(ev)
 +	if err != nil {
@@ -492,6 +516,80 @@ new file mode 100644
 +	}
 +	conftamerLog(kind, msg, ctx, nil, false, nil)
 +}
++
++// --- hooks for HTTP implementations outside net/http ---------------------
++//
++// golang.org/x/net/http2's server and grpc-go's client (patched by
++// contexttrack/x-net-http2-server.sh and grpc-client.patch) can't reach the
++// unexported logger, so they log through these.
++
++// ConftamerStampContext returns ctx with a context ID (see conftamerStampID).
++func ConftamerStampContext(ctx context.Context) context.Context {
++	return conftamerStampIDIfOn(ctx)
++}
++
++// ConftamerServerRequest gives a request built outside net/http the context
++// ID that conn.readRequest gives net/http's. c (the connection it arrived on)
++// and h2Stream (its HTTP/2 stream) are recorded only with go-inlibrary-conn.patch.
++func ConftamerServerRequest(r *Request, c net.Conn, h2Stream uint32) *Request {
++	if !conftamerOn() {
++		return r
++	}
++	return r.WithContext(conftamerStampID(r.Context()))
++}
++
++// ConftamerLogRequestReceived logs "Request received" for a server outside
++// net/http, about to call handler. Not when handler is net/http's own (an
++// http.Server's TLSNextProto passes it), whose serverHandler.ServeHTTP logs it.
++func ConftamerLogRequestReceived(r *Request, handler Handler) {
++	switch handler.(type) {
++	case serverHandler, initALPNRequest:
++		return
++	}
++	conftamerLogAt(2, time.Now(), "Request received", map[string]string{
++		"req.Method":       r.Method,
++		"req.URL.Path":     r.URL.Path,
++		"req.URL.RawQuery": r.URL.RawQuery,
++	}, r.Context(), nil, true, handler)
++}
++
++// ConftamerLogResponseSent logs "Response sent" for a server outside net/http.
++func ConftamerLogResponseSent(r *Request, code int) {
++	if r == nil {
++		return
++	}
++	// No caller identification: see conftamerLog.
++	conftamerLogAt(2, time.Now(), "Response sent", map[string]string{
++		"code":         strconv.Itoa(code),
++		"req.Method":   r.Method,
++		"req.URL.Path": r.URL.Path,
++	}, r.Context(), nil, false, nil)
++}
++
++// ConftamerLogClientRequest logs "Request sent" for a client outside net/http
++// (grpc-go's). Its connection (local, remote) and HTTP/2 stream (h2Stream) are
++// recorded only with go-inlibrary-conn.patch.
++func ConftamerLogClientRequest(ctx context.Context, method, host, path string, local, remote net.Addr, h2Stream uint32) {
++	if !conftamerOn() {
++		return
++	}
++	conftamerLogAt(2, time.Now(), "Request sent", map[string]string{
++		"req.Method":       method,
++		"req.URL.Host":     host,
++		"req.URL.Path":     path,
++		"req.URL.RawQuery": "",
++	}, ctx, &conftamerRequestID{Method: method, Host: host, Path: path}, true, nil)
++}
++
++// ConftamerLogClientResponse logs "Response received" for a client outside
++// net/http. No caller ID: it's logged on the connection's reader goroutine.
++func ConftamerLogClientResponse(ctx context.Context, method, path string, code int) {
++	conftamerLogAt(2, time.Now(), "Response received", map[string]string{
++		"resp.StatusCode": strconv.Itoa(code),
++		"req.Method":      method,
++		"req.URL.Path":    path,
++	}, ctx, nil, false, nil)
++}
 diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
 --- a/usr/local/go/src/net/http/h2_bundle.go
 +++ b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
@@ -504,7 +602,7 @@ diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src
  	return rw, req, nil
  }
 @@ -6385,6 +6386,11 @@
-
+ 
  // Run on its own goroutine.
  func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *Request, handler func(ResponseWriter, *Request)) {
 +	conftamerLog("Request received", map[string]string{
@@ -527,13 +625,13 @@ diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src
 +	}, rws.req.Context(), nil, false, nil)
  	rws.writeHeader(code)
  }
-
+ 
 diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/net/http/server.go
 --- a/usr/local/go/src/net/http/server.go
 +++ b/home/tcr6/go-conftamer/src/net/http/server.go
 @@ -1038,7 +1038,7 @@
  	delete(req.Header, "Host")
-
+ 
  	ctx, cancelCtx := context.WithCancel(ctx)
 -	req.ctx = ctx
 +	req.ctx = conftamerStampIDIfOn(ctx)
@@ -543,7 +641,7 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
 @@ -1159,6 +1159,13 @@
  	}
  	checkWriteHeaderCode(code)
-
+ 
 +	// No caller identification: see conftamerLog.
 +	conftamerLog("Response sent", map[string]string{
 +		"code":         strconv.Itoa(code),
@@ -568,10 +666,13 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
  	}
  	h.ServeHTTP(w, r)
  }
-@@ -3308,6 +3318,12 @@
+@@ -3308,6 +3318,15 @@
  		handler = globalOptionsHandler{}
  	}
-
+ 
++	// A server outside net/http (golang.org/x/net/http2) builds its own Request:
++	// give it the context ID conn.readRequest would have.
++	req = conftamerEnsureServerContext(req)
 +	conftamerLog("Request received", map[string]string{
 +		"req.Method":       req.Method,
 +		"req.URL.Path":     req.URL.Path,
@@ -580,7 +681,7 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
 +
  	handler.ServeHTTP(rw, req)
  }
-
+ 
 diff --git a/usr/local/go/src/net/http/transport.go b/home/tcr6/go-conftamer/src/net/http/transport.go
 --- a/usr/local/go/src/net/http/transport.go
 +++ b/home/tcr6/go-conftamer/src/net/http/transport.go
