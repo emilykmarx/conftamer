@@ -22,15 +22,16 @@ Apply [`go-inlibrary.patch`](go-inlibrary.patch) to a cloned copy of Go.
 (I directly copied the contents of `/usr/local/go` into `~/go-conftamer/`
 and applied the patch there.)
 
-To match events to packet captures, also apply
-[`debug/go-inlibrary-conn.patch`](debug/go-inlibrary-conn.patch) on top: it records each message's
-connection (`conn`, see [Output](#output)), and logs `Request sent` once per attempt
-rather than once per call.
+*If running with packet captures.* To match events to packet captures (for debugging -- optional), also apply
+[`debug/go-inlibrary-conn.patch`](debug/go-inlibrary-conn.patch) on top. It records each message's
+connection (`conn`, see [Output](#output)). For captures of TLS traffic, also apply
+[`debug/go-keylog.patch`](debug/go-keylog.patch).
 
 ```bash
 cp -r /usr/local/go ~/go-conftamer && cd ~/go-conftamer
 patch -p4 < ~/conftamer/contexttrack/go-inlibrary.patch
-patch -p4 < ~/conftamer/contexttrack/debug/go-inlibrary-conn.patch   # optional: for pcaps
+patch -p4 < ~/conftamer/contexttrack/debug/go-inlibrary-conn.patch   # optional: for pcaps (after go-inlibrary.patch)
+patch -p4 < ~/conftamer/contexttrack/debug/go-keylog.patch           # optional: for pcaps of TLS traffic
 ```
 
 Contexts are correlated by a monotonic ID stamped at an HTTP request's origin and
@@ -40,14 +41,38 @@ chain to a shared root heap address; it's no longer used (false positives
 from heap-address reuse, more vulnerable to custom types) but is preserved as
 [`go-inlibrary-optional.patch`](go-inlibrary-optional.patch).
 
-### Modify Prometheus' `common` (Prometheus only)
+**Remember to rebuild after patching.**
+
+### Modify third-party libraries
+
+You need to patch the copy of the library's source code that `go build` compiles, and it was non-obvious to me where those are. Seems like the patterns are:
+
+- Straightforward case: in the project repo directly (e.g., `caddy-route.patch` patches Caddy’s code)
+- A `replace` line in `go.mod`, which points to a local directory; patch that
+- Project keeps a full copy of source code of dependencies (see `Kubernetes`); compiled code is in `vendor/<module>/`.
+- Module cache, which is read-only: need to download a writable copy and manually add a `replace`:
+
+  ```bash
+  go mod download <module>@<version>
+  cp -r ~/go/pkg/mod/<module>@<version> ~/<name>-conftamer
+  chmod -R u+w ~/<name>-conftamer
+  cd /path/to/project && go mod edit -replace=<module>=$HOME/<name>-conftamer
+  ```
+
+Can check with `patch --dry-run` before applying.
+Each patch's header says which version it was made against.
+
+#### Prometheus' `common`
 
 `net/http`'s hooks only see `http.ServeMux` routing. Prometheus routes its real endpoints with `prometheus/common/route` (wrapping `julienschmidt/httprouter`).
 Without this its API events get a very coarse mount point (e.g., `pattern: /api/v1/` vs. `/api/v1/query`).
 
-Apply [`prometheus-common-route.patch`](prometheus-common-route.patch) to a writable copy of the module:
+Apply [`prometheus-common-route.patch`](prometheus-common-route.patch) to a writable copy of the module
+(v0.69.0 is what `~/prometheus-src` requires). Its paths are absolute, from a `diff` between the module
+cache and the copy, hence `-p4` (which leaves `route/route.go`, wherever the copy is):
 
 ```bash
+go mod download github.com/prometheus/common@v0.69.0
 cp -r ~/go/pkg/mod/github.com/prometheus/common@v0.69.0 ~/common-conftamer
 chmod -R u+w ~/common-conftamer
 cd ~/common-conftamer && patch -p4 < ~/conftamer/contexttrack/prometheus-common-route.patch
@@ -62,18 +87,93 @@ replace github.com/prometheus/common => /path/to/common-conftamer
 The fork calls `http.ConftamerLogRouted(pattern, req, handler)`, exported from the patched `net/http`.
 Handler: the application's handler for the matched route, ideally ID'd from the last "routed" message.
 
-### Other routers
+#### Other routers
 
-The same kind of hook for other routers, as patches with paths relative to the module root (`git apply`/`patch -p1`):
-- [`go-restful-route.patch`](go-restful-route.patch)
-- [`k8s-pathrecorder-route.patch`](k8s-pathrecorder-route.patch)
-- [`gorilla-mux-route.patch`](gorilla-mux-route.patch)
-- [`grafana-web-route.patch`](grafana-web-route.patch)
-- [`caddy-route.patch`](caddy-route.patch): Caddy's route matching (`caddyhttp` routes). The pattern is the
-  route's matchers, e.g. `path=["/api/*"]` (`&&` within a matcher set, `||` between sets, `*` for none).
-- [`grpc-route.patch`](grpc-route.patch): grpc-go's method dispatch, for a gRPC server served through
-  net/http (`Server.ServeHTTP`, e.g. etcd's on a ServeMux's `/`). The pattern is the full method name,
-  e.g. `/etcdserverpb.KV/Range`; unknown methods log nothing, so keep the outer router's pattern.
+The same kind of hook for other routers, as patches with paths relative to the module root
+(`patch -p1`, or `git apply` in a git checkout).
+
+[`caddy-route.patch`](caddy-route.patch): Caddy's route matching (`caddyhttp` routes). The pattern is the
+route's matchers, e.g. `path=["/api/*"]` (`&&` within a matcher set, `||` between sets, `*` for none).
+In place, in the Caddy checkout:
+
+```bash
+cd ~/caddy && patch -p1 < ~/conftamer/contexttrack/caddy-route.patch
+```
+
+[`k8s-pathrecorder-route.patch`](k8s-pathrecorder-route.patch): `k8s.io/apiserver`'s `PathRecorderMux`.
+In place, in Kubernetes' staging copy (which `~/kubernetes` replaces `k8s.io/apiserver` with):
+
+```bash
+cd ~/kubernetes/staging/src/k8s.io/apiserver && patch -p1 < ~/conftamer/contexttrack/k8s-pathrecorder-route.patch
+```
+
+[`go-restful-route.patch`](go-restful-route.patch): go-restful's route selection. In place for Kubernetes,
+which vendors it (v3.13.0):
+
+```bash
+cd ~/kubernetes/vendor/github.com/emicklei/go-restful/v3 && patch -p1 < ~/conftamer/contexttrack/go-restful-route.patch
+```
+
+NOTE: for a project that doesn't vendor it, need to copy the module (not applicable here):
+
+```bash
+cp -r ~/go/pkg/mod/github.com/emicklei/go-restful/v3@v3.13.0 ~/go-restful-conftamer
+chmod -R u+w ~/go-restful-conftamer
+cd ~/go-restful-conftamer && patch -p1 < ~/conftamer/contexttrack/go-restful-route.patch
+cd /path/to/project && go mod edit -replace=github.com/emicklei/go-restful/v3=$HOME/go-restful-conftamer
+```
+
+[`gorilla-mux-route.patch`](gorilla-mux-route.patch): gorilla/mux route matches.
+Used by Grafana.
+
+```bash
+cd ~/prombench-src/grafana
+GOWORK=off go mod download github.com/gorilla/mux@v1.8.1
+mkdir -p pkg/conftamer-mods/github.com/gorilla
+cp -r ~/go/pkg/mod/github.com/gorilla/mux@v1.8.1 pkg/conftamer-mods/github.com/gorilla/mux
+chmod -R u+w pkg/conftamer-mods/github.com/gorilla/mux
+(cd pkg/conftamer-mods/github.com/gorilla/mux && patch -p1 < ~/conftamer/contexttrack/gorilla-mux-route.patch)
+go work edit -replace=github.com/gorilla/mux=./pkg/conftamer-mods/github.com/gorilla/mux
+```
+
+[`grafana-web-route.patch`](grafana-web-route.patch): Grafana's `pkg/web` (Macaron-derived) router.
+In place, in the Grafana checkout:
+
+```bash
+cd ~/prombench-src/grafana && patch -p1 < ~/conftamer/contexttrack/grafana-web-route.patch
+```
+
+[`grpc-route.patch`](grpc-route.patch): grpc-go's method dispatch; need to apply for etcd:
+
+```bash
+go mod download google.golang.org/grpc@<version>
+cp -r ~/go/pkg/mod/google.golang.org/grpc@<version> ~/grpc-conftamer
+chmod -R u+w ~/grpc-conftamer
+cd ~/grpc-conftamer && patch -p1 < ~/conftamer/contexttrack/grpc-route.patch
+cd /path/to/etcd/server && go mod edit -replace=google.golang.org/grpc=$HOME/grpc-conftamer # REPLACE WITH ETCD
+```
+
+In Kubernetes, which vendors grpc (v1.82.1), apply it in place in `~/kubernetes/vendor/google.golang.org/grpc`.
+
+#### gRPC client
+
+[`grpc-client.patch`](grpc-client.patch) (`patch -p1`, to `google.golang.org/grpc`, alongside
+`grpc-route.patch`): logs a gRPC client's requests and responses (`http2_client.go`'s
+`NewStream` and its response headers), with a context ID so the response links to the request.
+
+#### `golang.org/x/net/http2` server
+
+A server using `golang.org/x/net/http2` directly (vs. `net/http`'s bundled copy) needs
+[`x-net-http2-server.sh`](x-net-http2-server.sh). Note this is a script, not a patch,
+since the code differs slightly between versions, and different modules use different versions.
+
+```bash
+~/conftamer/contexttrack/x-net-http2-server.sh ~/xnet-conftamer
+```
+
+Then `replace golang.org/x/net => /path/to/xnet-conftamer` (as Prometheus and Caddy do).
+
+**Don't forget to rebuild everything after patching.**
 
 ### Set Environment Variables
 
