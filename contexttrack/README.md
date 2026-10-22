@@ -71,6 +71,9 @@ The same kind of hook for other routers, as patches with paths relative to the m
 - [`grafana-web-route.patch`](grafana-web-route.patch)
 - [`caddy-route.patch`](caddy-route.patch): Caddy's route matching (`caddyhttp` routes). The pattern is the
   route's matchers, e.g. `path=["/api/*"]` (`&&` within a matcher set, `||` between sets, `*` for none).
+- [`grpc-route.patch`](grpc-route.patch): grpc-go's method dispatch, for a gRPC server served through
+  net/http (`Server.ServeHTTP`, e.g. etcd's on a ServeMux's `/`). The pattern is the full method name,
+  e.g. `/etcdserverpb.KV/Range`; unknown methods log nothing, so keep the outer router's pattern.
 
 ### Set Environment Variables
 

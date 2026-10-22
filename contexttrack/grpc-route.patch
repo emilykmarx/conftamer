@@ -1,0 +1,57 @@
+# ConfTamer: log gRPC's method dispatch, for requests served via Server.ServeHTTP, as "Request routed".
+# Without it, a gRPC server mounted on an http.ServeMux (e.g. etcd's grpcHandlerFunc on "/") gets the mux's
+# pattern for every method.
+# Applies to google.golang.org/grpc (made against v1.59.0; same context through v1.75); paths are relative
+# to the module root (patch -p1).
+# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted, with its handler argument).
+
+--- a/server.go
++++ b/server.go
+@@ -1036,6 +1036,8 @@
+ 		// already been written to w.
+ 		return
+ 	}
++	// ConfTamer: log the method handleStream will dispatch r to (see conftamer.go)
++	s.conftamerLogRouted(r)
+ 	if !s.addConn(listenerAddressForServeHTTP, st) {
+ 		return
+ 	}
+--- /dev/null
++++ b/conftamer.go
+@@ -0,0 +1,36 @@
++package grpc
++
++import (
++	"net/http"
++	"strings"
++)
++
++// conftamerLogRouted logs, as "Request routed", the registered method that
++// handleStream will dispatch r to. The pattern is the full method name
++// ("/service/method", as r's path); the handler is the method's generated
++// handler (e.g. etcdserverpb._KV_Range_Handler). Unknown services and methods
++// aren't logged, so they keep the pattern of the router that passed r to s.
++//
++// Only requests served via ServeHTTP are logged: those reached s through
++// net/http, which logged their "Request received". Requests on s's own
++// transport (Serve) have no such event to attach a route to.
++func (s *Server) conftamerLogRouted(r *http.Request) {
++	sm := strings.TrimPrefix(r.URL.Path, "/")
++	pos := strings.LastIndex(sm, "/")
++	if pos == -1 {
++		return
++	}
++	srv, ok := s.services[sm[:pos]]
++	if !ok {
++		return
++	}
++	var handler any
++	if md, ok := srv.methods[sm[pos+1:]]; ok {
++		handler = md.Handler
++	} else if sd, ok := srv.streams[sm[pos+1:]]; ok {
++		handler = sd.Handler
++	} else {
++		return
++	}
++	http.ConftamerLogRouted(r.URL.Path, r, handler)
++}
