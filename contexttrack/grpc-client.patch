@@ -1,0 +1,33 @@
+diff --git a/internal/transport/http2_client.go b/internal/transport/http2_client.go
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -736,6 +736,8 @@
+ // streams.  All non-nil errors returned will be *NewStreamError.
+ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*Stream, error) {
+ 	ctx = peer.NewContext(ctx, t.getPeer())
++	// conftamer: a context ID, so the response (logged from the stream's context) links to it
++	ctx = http.ConftamerStampContext(ctx)
+ 
+ 	// ServerName field of the resolver returned address takes precedence over
+ 	// Host field of CallHdr to determine the :authority header. This is because,
+@@ -901,6 +903,8 @@
+ 		}
+ 		t.GracefulClose()
+ 	}
++	// conftamer: logged in the caller's goroutine (for its api_id), with the stream's ID
++	http.ConftamerLogClientRequest(s.ctx, http.MethodPost, callHdr.Host, callHdr.Method, t.localAddr, t.remoteAddr, s.id)
+ 	return s, nil
+ }
+ 
+@@ -1533,6 +1537,11 @@
+ 		return
+ 	}
+ 
++	// conftamer: the response (its first HEADERS frame; a later one is its trailers)
++	if initialHeader && httpStatusCode != nil {
++		http.ConftamerLogClientResponse(s.ctx, http.MethodPost, s.method, *httpStatusCode)
++	}
++
+ 	// For headers, set them in s.header and close headerChan.  For trailers or
+ 	// trailers-only, closeStream will set the trailers and close headerChan as
+ 	// needed.
