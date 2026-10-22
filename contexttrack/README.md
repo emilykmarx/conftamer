@@ -22,6 +22,17 @@ Apply [`go-inlibrary.patch`](go-inlibrary.patch) to a cloned copy of Go.
 (I directly copied the contents of `/usr/local/go` into `~/go-conftamer/`
 and applied the patch there.)
 
+To match events to packet captures, also apply
+[`debug/go-inlibrary-conn.patch`](debug/go-inlibrary-conn.patch) on top: it records each message's
+connection (`conn`, see [Output](#output)), and logs `Request sent` once per attempt
+rather than once per call.
+
+```bash
+cp -r /usr/local/go ~/go-conftamer && cd ~/go-conftamer
+patch -p4 < ~/conftamer/contexttrack/go-inlibrary.patch
+patch -p4 < ~/conftamer/contexttrack/debug/go-inlibrary-conn.patch   # optional: for pcaps
+```
+
 Contexts are correlated by a monotonic ID stamped at an HTTP request's origin and
 inherited down the context chain.
 An earlier approach instead walked the context's parent
@@ -88,7 +99,20 @@ Kinds are `Request sent`, `Request received`, `Response sent`, `Response receive
 `Request routed` (used to find the most specific routed `pattern` that corresponds to a
 request; see [router patches](#other-routers)).
 
-`Request sent` events also carry `call_chain`.
+Every event also carries `call_chain`: the full stack where it was logged, innermost frame first.
+
+Every event has `ts` (Unix ns). `Request sent` is logged once per `RoundTrip` call, before
+any connection is chosen.
+
+With `go-inlibrary-conn.patch`, `Request sent` is instead logged once the request has a
+connection, so once per attempt (and, when an alternate protocol such as
+`golang.org/x/net/http2` takes the request, when it's handed over). `Request sent` (HTTP/1 only),
+`Request received`, `Request routed` and `Response sent` also carry `conn`: the connection
+as this end's socket sees it, e.g.
+`{"local":"10.244.1.2:47832","remote":"10.96.0.20:80","index":1}`. `index` is the request's
+position on an HTTP/1 connection (from 0); HTTP/2 server events have `h2_stream` instead.
+This is the key for matching events to packet captures
+(`debug/pcap_messages.py`, whose records carry the same `conn` for each end).
 
 A request sent through `http.Client` produces two `Response received` events (one from
 the transport read loop, one from `Client.do`); both analysis scripts deduplicate, keeping

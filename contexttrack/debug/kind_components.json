@@ -1,0 +1,13 @@
+{
+  "_comment": "compare_message_types.py's rules for naming endpoints that aren't instrumented pods, for a kind cluster (default pod CIDR 10.244.0.0/16, Docker network 172.18.0.0/16, kindnet CNI).",
+  "address_components": [
+    ["10\\.244\\.\\d+\\.1:\\d+", "kubelet"],
+    ["172\\.18\\.0\\.1:\\d+", "(host machine)"]
+  ],
+  "processes": {
+    "kube-controller": "kube-controller-manager",
+    "kindnetd": "kindnet-cni"
+  },
+  "probe_paths": ["/readyz", "/livez", "/healthz", "/health", "/ready"],
+  "probe_component": "kubelet"
+}

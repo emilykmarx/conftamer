@@ -17,7 +17,7 @@ Types with no match get a row with the other side blank.
 
 Run: python3 contexttrack/analysis/match_messages.py RUN_DIR -o types.csv
 With -o, also writes types.messages.jsonl: each client-side type's messages
-(time, node, connection), for compare_message_types.py.
+(time, node, connection), for debug/compare_message_types.py.
 """
 
 import argparse

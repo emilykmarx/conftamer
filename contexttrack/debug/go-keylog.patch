@@ -1,0 +1,58 @@
+diff --git a/usr/local/go/src/crypto/tls/common.go b/home/tcr6/go-conftamer/src/crypto/tls/common.go
+--- a/usr/local/go/src/crypto/tls/common.go
++++ b/home/tcr6/go-conftamer/src/crypto/tls/common.go
+@@ -1589,14 +1589,19 @@
+ )
+ 
+ func (c *Config) writeKeyLog(label string, clientRandom, secret []byte) error {
+-	if c.KeyLogWriter == nil {
++	w := c.KeyLogWriter
++	if w == nil {
++		// conftamer: fall back to $CONFTAMER_KEYLOG, if set.
++		w = conftamerKeyLog()
++	}
++	if w == nil {
+ 		return nil
+ 	}
+ 
+ 	logLine := fmt.Appendf(nil, "%s %x %x\n", label, clientRandom, secret)
+ 
+ 	writerMutex.Lock()
+-	_, err := c.KeyLogWriter.Write(logLine)
++	_, err := w.Write(logLine)
+ 	writerMutex.Unlock()
+ 
+ 	return err
+diff --git a/home/tcr6/go-conftamer/src/crypto/tls/conftamer_keylog.go b/home/tcr6/go-conftamer/src/crypto/tls/conftamer_keylog.go
+new file mode 100644
+--- /dev/null
++++ b/home/tcr6/go-conftamer/src/crypto/tls/conftamer_keylog.go
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package tls
++
++import (
++	"io"
++	"os"
++	"sync"
++)
++
++// conftamerKeyLog returns the process-wide key log writer named by
++// $CONFTAMER_KEYLOG (NSS key log format, as for Config.KeyLogWriter), or nil
++// if it's unset or can't be opened. Used for every Config that sets no
++// KeyLogWriter of its own, so packet captures of any TLS connection the
++// process makes or accepts can be decrypted.
++var conftamerKeyLog = sync.OnceValue(func() io.Writer {
++	path := os.Getenv("CONFTAMER_KEYLOG")
++	if path == "" {
++		return nil
++	}
++	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
++	if err != nil {
++		return nil
++	}
++	return f
++})
