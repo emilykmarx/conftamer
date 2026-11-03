@@ -45,7 +45,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,615 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -128,6 +128,11 @@ new file mode 100644
 +	Context     *conftamerContextInfo `json:"context"`
 +	RequestID   *conftamerRequestID   `json:"request_id,omitempty"`
 +	ApiId       string                `json:"api_id,omitempty"`
++	// Ancestry and Stack describe the goroutine that logged the event (see
++	// conftamerSplitStack): Ancestry is the same for every event it logs, and
++	// Stack is what it was running, starting at the function that logged it.
++	Ancestry string `json:"ancestry"`
++	Stack    string `json:"stack"`
 +	// Handler is the name of the Handler serving a "Request received" event, or
 +	// the Handler a ServeMux routed a "Request routed" event to.
 +	// Not set on "Response sent".
@@ -389,6 +394,71 @@ new file mode 100644
 +	return chain
 +}
 +
++// conftamerGoroutineStack returns runtime.Stack's output for the calling
++// goroutine, whole.
++func conftamerGoroutineStack() string {
++	buf := make([]byte, 64<<10)
++	for {
++		n := runtime.Stack(buf, false)
++		if n < len(buf) {
++			return string(buf[:n])
++		}
++		buf = make([]byte, 2*len(buf))
++	}
++}
++
++// conftamerSplitStack splits s, runtime.Stack's output for one goroutine, into
++// the goroutine's ancestry and its stack, and leaves out the frames at the top
++// of the stack whose function skip reports true (the logger's own frames).
++//
++// The ancestry is the goroutine's ID line without its state ("goroutine 8"),
++// followed by the rest of s from its "created by" line: where the goroutine
++// was created, and, with GODEBUG=tracebackancestors=N, the stacks of its
++// ancestors when they created their children ("[originating from goroutine
++// 7]:" sections). It's the same at every point in the goroutine, so it can be
++// used to join records made in the same goroutine. The stack is s's first line
++// and the frames before "created by", i.e. what the goroutine is running.
++//
++// argmatch (dump_ancestors/argmatch, splitStack in rt/rt.go) splits the stacks
++// of the calls it checks in the same way, so the ancestries in the two outputs can be
++// compared; keep the two in step.
++func conftamerSplitStack(s string, skip func(fn string) bool) (ancestry, stack string) {
++	first, rest, _ := strings.Cut(s, "\n")
++	id, _, _ := strings.Cut(first, " [")
++	frames, lineage := rest, ""
++	if i := strings.Index("\n"+rest, "\ncreated by "); i >= 0 {
++		frames, lineage = rest[:i], rest[i:]
++	}
++	// Each frame is a function line, e.g. "main.f(0x1, ...)", then a file line.
++	for frames != "" {
++		fn, after, _ := strings.Cut(frames, "\n")
++		if i := strings.LastIndex(fn, "("); i >= 0 {
++			fn = fn[:i]
++		}
++		if !skip(fn) {
++			break
++		}
++		_, frames, _ = strings.Cut(after, "\n")
++	}
++	ancestry = id
++	if lineage = strings.TrimRight(lineage, "\n"); lineage != "" {
++		ancestry += "\n" + lineage
++	}
++	return ancestry, first + "\n" + strings.TrimRight(frames, "\n")
++}
++
++// conftamerIsLogger reports whether fn, a function named as in a stack trace,
++// is part of the logger rather than the function that logged an event (the
++// frames conftamerLogAt leaves out of CallChain, and the function that calls
++// runtime.Stack).
++func conftamerIsLogger(fn string) bool {
++	switch fn {
++	case "net/http.conftamerGoroutineStack", "net/http.conftamerLog", "net/http.conftamerLogAt":
++		return true
++	}
++	return false
++}
++
 +// --- logging entry point -----------------------------------------------
 +
 +// conftamerLog records one HTTP event. ctx is the context with ID used for correlation.
@@ -449,6 +519,7 @@ new file mode 100644
 +	// Skip conftamerLog(At), so the chain starts at the function that logged
 +	// the event (Transport.roundTrip, serverHandler.ServeHTTP, conftamerLogRouted, ...)
 +	ev.CallChain = conftamerCallChain(skip)
++	ev.Ancestry, ev.Stack = conftamerSplitStack(conftamerGoroutineStack(), conftamerIsLogger)
 +
 +	linebytes, err := json.Marshal(ev)
 +	if err != nil {
