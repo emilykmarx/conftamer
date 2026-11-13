@@ -251,6 +251,49 @@ def _msg_label(ev: dict, n_paths: int | None = None) -> str:
     return "{" + ", ".join(f"{k}: {v}" for k, v in _label_fields(ev, n_paths)) + "}"
 
 
+def messages(events: list[dict]) -> list[tuple[tuple, dict]]:
+    """Return the events that are messages, as (context group, event) in
+    arrival order: the graph's nodes are keyed on these.
+
+    First drops the transport's duplicate "Response received" events
+    (dedup_responses), stamps route patterns and api_ids (_stamp_routes), and
+    attributes each response to the request it answers (_attribute_response).
+    "Request routed" events aren't messages (they only contribute their route
+    pattern), and neither are events without a context ID or message.
+
+    The returned events are the same dicts as in `events`, with the stamps added.
+    """
+    events = dedup_responses(events)
+    _stamp_routes(events)
+    # (group, (method, path)) -> most recent "Request received" with that identity,
+    # used to attribute each response back to the request it answers
+    open_requests: dict[tuple, dict] = {}
+    out = []
+    for ev in events:
+        context_id = ev.get("context", {}).get("context_id")
+        if not context_id or "message" not in ev:
+            continue
+        group = (ev.get("pid"), context_id)
+        _attribute_response(ev, group, open_requests)
+        # Routing metadata, not a message: contributes its pattern, not a node
+        if ev.get("kind") == "Request routed":
+            continue
+        out.append((group, ev))
+    return out
+
+
+def node_path_counts(msgs: list[tuple[tuple, dict]]) -> dict[tuple, int]:
+    """Return {message key: how many distinct concrete paths are keyed to it}
+    for messages(), the "paths" count in labels. >1 only for nodes keyed on a
+    route pattern, which covers every path that pattern matched."""
+    node_paths: dict[tuple, set[str]] = defaultdict(set)
+    for _, ev in msgs:
+        path = _event_path(ev)
+        if path:
+            node_paths[_msg_key(ev)].add(path)
+    return {k: len(v) for k, v in node_paths.items()}
+
+
 def main() -> None:
     default_path = Path.home() / "conftamer" / "contexttrack" / "events" / "events.jsonl"
 
@@ -269,35 +312,18 @@ def main() -> None:
     groups_seen: dict[tuple, set] = defaultdict(set)
     # message key -> one representative event (for labelling)
     msg_rep: dict[tuple, dict] = {}
-    # message key -> distinct concrete paths keyed to it. >1 only for nodes
-    # keyed on a route pattern, which covers every path that pattern matched.
-    node_paths: dict[tuple, set[str]] = defaultdict(set)
-    # (group, (method, path)) -> most recent "Request received" with that identity,
-    # used to attribute each response back to the request it answers
-    open_requests: dict[tuple, dict] = {}
 
     # Read in full so routes can be resolved before any event is keyed
-    events = dedup_responses(list(load_events(args.file)))
-    _stamp_routes(events)
+    msgs = messages(list(load_events(args.file)))
+    node_paths = node_path_counts(msgs)
 
-    for ev in events:
-        context_id = ev.get("context", {}).get("context_id")
-        if not context_id or "message" not in ev:
-            continue
-        context_id = (ev.get("pid"), context_id)
-        _attribute_response(ev, context_id, open_requests)
-        # Routing metadata, not a message: contributes its pattern, not a node
-        if ev.get("kind") == "Request routed":
-            continue
+    for context_id, ev in msgs:
         key = _msg_key(ev)
         if key not in groups_seen[context_id]:
             groups_seen[context_id].add(key)
             groups[context_id].append((key, ev.get("kind", "")))
         if key not in msg_rep:
             msg_rep[key] = ev
-        path = _event_path(ev)
-        if path:
-            node_paths[key].add(path)
 
     def _is_received(kind: str) -> bool:
         return "received" in kind.lower()
@@ -368,7 +394,7 @@ def main() -> None:
         print("digraph messages {")
         print('  node [shape=box fontname="monospace" fontsize=10]')
         for k in all_keys:
-            label = _dot_label(msg_rep[k], len(node_paths[k])).replace('"', '\\"')
+            label = _dot_label(msg_rep[k], node_paths.get(k, 0)).replace('"', '\\"')
             print(f'  n{node_id[k]} [label="{label}"]')
         for a, b in sorted(edges, key=lambda e: (node_id[e[0]], node_id[e[1]])):
             print(f"  n{node_id[a]} -> n{node_id[b]}")
@@ -381,7 +407,7 @@ def main() -> None:
         for k in all_keys:
             ev = msg_rep[k]
             kind = ev.get("kind", "?")
-            print(f"  [{node_id[k]}] {kind}  {_msg_label(ev, len(node_paths[k]))}")
+            print(f"  [{node_id[k]}] {kind}  {_msg_label(ev, node_paths.get(k, 0))}")
 
         print(f"\nEdges ({len(edges)}):")
         for a, b in sorted(edges, key=lambda e: (node_id[e[0]], node_id[e[1]])):

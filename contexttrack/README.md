@@ -204,6 +204,14 @@ request; see [router patches](#other-routers)).
 
 Every event also carries `call_chain`: the full stack where it was logged, innermost frame first.
 
+Every event also carries `ancestry` and `stack`, from `runtime.Stack` for the goroutine that
+logged it. `ancestry` is the goroutine's ID, where it was created, and, with
+`GODEBUG=tracebackancestors=N`, its ancestors' stacks when they created their children; it's
+the same for every event a goroutine logs. `stack` is what the goroutine was running, from
+the function that logged the event. argmatch (`dump_ancestors/argmatch`) writes the same two
+values in the same format for each call it checks (its calls output), so its matches can be
+joined to these events on `ancestry`; `conftamerSplitStack` in `conftamer.go` defines the format.
+
 Every event has `ts` (Unix ns). `Request sent` is logged once per `RoundTrip` call, before
 any connection is chosen.
 
