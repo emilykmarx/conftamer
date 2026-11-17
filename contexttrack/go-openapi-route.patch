@@ -1,0 +1,20 @@
+# ConfTamer: log go-openapi/runtime's router matches (go-swagger generated servers, e.g. Alertmanager's /api/v2) as "Request routed".
+# Applies to github.com/go-openapi/runtime (made against v0.27.1, Alertmanager v0.27.0's); paths are relative to the module root (patch -p1).
+# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted, with its handler argument).
+
+--- a/middleware/router.go
++++ b/middleware/router.go
+@@ -76,7 +76,12 @@
+ 	}
+ 
+ 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+-		if _, rCtx, ok := ctx.RouteInfo(r); ok {
++		if route, rCtx, ok := ctx.RouteInfo(r); ok {
++			// ConfTamer: the matched operation's path template, as the router
++			// matched it (the spec's basePath included), e.g.
++			// /api/v2/silence/{silenceID}. route.Handler is the operation's own
++			// handler (next is the router's middleware chain).
++			http.ConftamerLogRouted(route.PathPattern, r, route.Handler)
+ 			next.ServeHTTP(rw, rCtx)
+ 			return
+ 		}

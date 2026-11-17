@@ -129,6 +129,27 @@ def _stamp_routes(events: list[dict]) -> None:
             last["message"]["pattern"],
         )
 
+    # A request whose routers all saw a shortened path (e.g. Grafana's, which
+    # strips its sub path, GF_SERVER_SERVE_FROM_SUB_PATH, before any router
+    # runs) has no chain under its own path: take the chain (same pid, context
+    # and method) whose first path is a suffix of its path, and give both the
+    # request and the chain (so the response, logged with the shortened path,
+    # too) the full pattern.
+    for ev in events:
+        if ev.get("kind") != "Request received":
+            continue
+        key = _route_key(ev)
+        if key is None or key in routes:
+            continue
+        for prev in group_keys.get(key[:2], ()):
+            if prev[2] == key[2] and prev[3] != key[3] and key[3].endswith(prev[3]):
+                last = hops[prev][-1]
+                routes[key] = routes[prev] = _full_pattern(
+                    key[3], last["message"]["req.URL.Path"], last["message"]["pattern"])
+                if prev in route_api_ids:
+                    route_api_ids[key] = route_api_ids[prev]
+                break
+
     for ev in events:
         if ev.get("kind") == "Request routed":
             continue
