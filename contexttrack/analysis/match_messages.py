@@ -145,9 +145,23 @@ def caddy_pattern_matches(pattern: str, path: str) -> bool | None:
 
 
 def pattern_matches(pattern: str, path: str) -> bool:
-    """Whether route `pattern` matches concrete `path`. Handles ServeMux
-    {x}, {x...}, {$} and trailing-"/" subtrees, go-restful {x:*} and {x:regex},
-    httprouter :x and *x, and Caddy's matcher patterns."""
+    """Whether route `pattern` matches concrete `path`: the whole path must
+    match. In `pattern`:
+    - ServeMux's `{x}` matches one segment (`[^/]+`); `{x...}` and go-restful's
+      `{x:*}` match anything, slashes included; go-restful's `{x:<regex>}`
+      matches the regex; the name in the braces doesn't matter;
+    - `{$}` at the end matches nothing more (no subtree, below);
+    - httprouter's `:name` (a colon and an identifier), anywhere, matches one
+      segment; so does a literal colon in a path (`services/alertmanager:am-web`
+      matches `services/alertmanager<anything>-web`);
+    - httprouter's `*name` at the end (catch-all) matches anything;
+    - a trailing `/` also matches everything below it (ServeMux subtree),
+      unless the pattern ends in `{$}`;
+    - a pattern that is exactly `*`, or starts with `<name>=`, is a Caddy
+      matcher pattern (caddy_pattern_matches; so `*` alone matches every path);
+    - text before the first `/` is dropped (ServeMux patterns can lead with a
+      method and host: strip_pattern);
+    - everything else, regex characters included, is literal."""
     caddy = caddy_pattern_matches(pattern, path)
     if caddy is not None:
         return caddy
