@@ -66,6 +66,7 @@ Each patch's header says which version it was made against.
 
 `net/http`'s hooks only see `http.ServeMux` routing. Prometheus routes its real endpoints with `prometheus/common/route` (wrapping `julienschmidt/httprouter`).
 Without this its API events get a very coarse mount point (e.g., `pattern: /api/v1/` vs. `/api/v1/query`).
+The Prometheus Alertmanager also uses this router for some of its routes (e.g. the UI, `/-/ready`, `/-/reload`).
 
 Apply [`prometheus-common-route.patch`](prometheus-common-route.patch) to a writable copy of the module
 (v0.69.0 is what `~/prometheus-src` requires). Its paths are absolute, from a `diff` between the module
@@ -78,7 +79,7 @@ chmod -R u+w ~/common-conftamer
 cd ~/common-conftamer && patch -p4 < ~/conftamer/contexttrack/prometheus-common-route.patch
 ```
 
-Then point Prometheus at it, in `~/prometheus-src/go.mod`:
+Then point Prometheus or the Alertmanager at it, in `~/prometheus-src/go.mod`:
 
 ```
 replace github.com/prometheus/common => /path/to/common-conftamer
@@ -122,6 +123,10 @@ chmod -R u+w ~/go-restful-conftamer
 cd ~/go-restful-conftamer && patch -p1 < ~/conftamer/contexttrack/go-restful-route.patch
 cd /path/to/project && go mod edit -replace=github.com/emicklei/go-restful/v3=$HOME/go-restful-conftamer
 ```
+
+[`go-openapi-route.patch`](go-openapi-route.patch): go-openapi/runtime's router (go-swagger generated servers).
+Used by the Prometheus Alertmanager for its /api/v2, where Prometheus posts alerts (in addition to the `common` router for its other routes).
+Not vendored by Alertmanager: copy the module and add a replace, as for go-restful.
 
 [`gorilla-mux-route.patch`](gorilla-mux-route.patch): gorilla/mux route matches.
 Used by Grafana.

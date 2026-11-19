@@ -13,7 +13,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/client.go b/home/tcr6/go-confta
 diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-conftamer/src/net/http/conftamer.go
 --- a/home/tcr6/go-conftamer/src/net/http/conftamer.go
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -87,18 +87,70 @@
+@@ -92,18 +92,72 @@
  	// CallChain is the full stack at the event, innermost frame first, starting
  	// at the function that logged it.
  	CallChain []conftamerFrame `json:"call_chain,omitempty"`
@@ -68,8 +68,10 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 +	if hasID && conftamerServerConn(ctx) != nil {
  		return r
  	}
--	return r.WithContext(conftamerStampID(r.Context()))
-+	ctx = conftamerStampID(ctx)
+-	return r.WithContext(conftamerStampServer(r.Context(), r.URL.Path))
++	if !hasID {
++		ctx = conftamerStampServer(ctx, r.URL.Path)
++	}
 +	if conftamerServerConn(ctx) == nil {
 +		if local, ok := ctx.Value(LocalAddrContextKey).(net.Addr); ok && r.RemoteAddr != "" {
 +			ctx = conftamerWithConn(ctx, &conftamerConnInfo{Local: local.String(), Remote: r.RemoteAddr})
@@ -87,7 +89,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  }
  
  type conftamerFrame struct {
-@@ -348,7 +400,7 @@
+@@ -448,7 +502,7 @@
  // handler (non-nil only for "Request received" and "Request routed") is the not-yet-invoked
  // Handler about to serve the request — when set, it's used instead of a stack walk, since
  // the application handler isn't on the stack yet at that log point, and its name is
@@ -96,7 +98,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  //
  // "Response sent" deliberately does NOT identify a caller: at the point a response is
  // written, the stack holds whatever the handler last called (fmt.Fprintln,
-@@ -357,13 +409,13 @@
+@@ -457,13 +511,13 @@
  // analysis (contexttrack/analysis/message_graph.py) recovers api_id/handler by matching
  // each response back to the "Request received" it answers, and the matched route pattern
  // from the "Request routed" events logged by conftamerLogRouted.
@@ -113,7 +115,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  	if !conftamerOn() {
  		return
  	}
-@@ -379,6 +431,7 @@
+@@ -479,6 +533,7 @@
  		Line:        line,
  		Message:     msg,
  		Context:     conftamerContext(ctx),
@@ -121,7 +123,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  	}
  
  	if withCaller {
-@@ -432,7 +485,7 @@
+@@ -533,7 +588,7 @@
  		"pattern":      pattern,
  		"req.Method":   r.Method,
  		"req.URL.Path": r.URL.Path,
@@ -130,7 +132,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  }
  
  // ConftamerLogRouted records a route pattern matched by a router outside this
-@@ -466,7 +519,7 @@
+@@ -567,7 +622,7 @@
  			ctx = r.Context()
  		}
  	}
@@ -139,7 +141,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  }
  
  // --- hooks for HTTP implementations outside net/http ---------------------
-@@ -481,13 +534,17 @@
+@@ -582,13 +637,17 @@
  }
  
  // ConftamerServerRequest gives a request built outside net/http the context
@@ -151,8 +153,8 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  	if !conftamerOn() {
  		return r
  	}
--	return r.WithContext(conftamerStampID(r.Context()))
-+	ctx := conftamerStampID(r.Context())
+-	return r.WithContext(conftamerStampServer(r.Context(), r.URL.Path))
++	ctx := conftamerStampServer(r.Context(), r.URL.Path)
 +	if c != nil {
 +		ctx = conftamerWithConn(ctx, conftamerNewConnInfo(c, -1, h2Stream))
 +	}
@@ -160,7 +162,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  }
  
  // ConftamerLogRequestReceived logs "Request received" for a server outside
-@@ -502,7 +559,7 @@
+@@ -603,7 +662,7 @@
  		"req.Method":       r.Method,
  		"req.URL.Path":     r.URL.Path,
  		"req.URL.RawQuery": r.URL.RawQuery,
@@ -169,10 +171,10 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  }
  
  // ConftamerLogResponseSent logs "Response sent" for a server outside net/http.
-@@ -515,22 +572,25 @@
+@@ -616,22 +675,25 @@
  		"code":         strconv.Itoa(code),
  		"req.Method":   r.Method,
- 		"req.URL.Path": r.URL.Path,
+ 		"req.URL.Path": conftamerRecvPath(r),
 -	}, r.Context(), nil, false, nil)
 +	}, r.Context(), nil, false, nil, conftamerServerConn(r.Context()))
  }
@@ -199,7 +201,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
  }
  
  // ConftamerLogClientResponse logs "Response received" for a client outside
-@@ -540,5 +600,5 @@
+@@ -641,5 +703,5 @@
  		"resp.StatusCode": strconv.Itoa(code),
  		"req.Method":      method,
  		"req.URL.Path":    path,
@@ -212,7 +214,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/h2_bundle.go b/home/tcr6/go-con
 @@ -6315,6 +6315,9 @@
  		Trailer:    res.Trailer,
  	}).WithContext(st.ctx)
- 	req.ctx = conftamerStampIDIfOn(req.Context())
+ 	req.ctx = conftamerStampServer(req.Context(), req.URL.Path)
 +	if conftamerOn() {
 +		req.ctx = conftamerWithConn(req.ctx, conftamerNewConnInfo(sc.conn, -1, st.id))
 +	}
@@ -231,7 +233,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/h2_bundle.go b/home/tcr6/go-con
 @@ -6951,7 +6954,7 @@
  		"code":         strconv.Itoa(code),
  		"req.Method":   rws.req.Method,
- 		"req.URL.Path": rws.req.URL.Path,
+ 		"req.URL.Path": conftamerRecvPath(rws.req),
 -	}, rws.req.Context(), nil, false, nil)
 +	}, rws.req.Context(), nil, false, nil, conftamerServerConn(rws.req.Context()))
  	rws.writeHeader(code)
@@ -252,7 +254,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/server.go b/home/tcr6/go-confta
 @@ -1039,6 +1041,10 @@
  
  	ctx, cancelCtx := context.WithCancel(ctx)
- 	req.ctx = conftamerStampIDIfOn(ctx)
+ 	req.ctx = conftamerStampServer(ctx, req.URL.Path)
 +	if conftamerOn() {
 +		req.ctx = conftamerWithConn(req.ctx, conftamerNewConnInfo(c.rwc, c.conftamerReqs, 0))
 +		c.conftamerReqs++
@@ -263,7 +265,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/server.go b/home/tcr6/go-confta
 @@ -1164,7 +1170,7 @@
  		"code":         strconv.Itoa(code),
  		"req.Method":   w.req.Method,
- 		"req.URL.Path": w.req.URL.Path,
+ 		"req.URL.Path": conftamerRecvPath(w.req),
 -	}, w.req.Context(), nil, false, nil)
 +	}, w.req.Context(), nil, false, nil, conftamerServerConn(w.req.Context()))
  

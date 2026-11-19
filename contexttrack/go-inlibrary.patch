@@ -45,7 +45,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,645 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -151,7 +151,7 @@ new file mode 100644
 +	if _, ok := r.Context().Value(conftamerIDKey).(uint64); ok {
 +		return r
 +	}
-+	return r.WithContext(conftamerStampID(r.Context()))
++	return r.WithContext(conftamerStampServer(r.Context(), r.URL.Path))
 +}
 +
 +type conftamerFrame struct {
@@ -205,6 +205,36 @@ new file mode 100644
 +		return ctx
 +	}
 +	return conftamerStampID(ctx)
++}
++
++// conftamerRecvPathKey is the context.Value key for the path a server received
++// a request with (conftamerStampServer).
++type conftamerRecvPathKeyType struct{}
++
++var conftamerRecvPathKey conftamerRecvPathKeyType
++
++// conftamerStampServer is conftamerStampIDIfOn for a request a server just
++// received, before any handler runs: it also records the request's path, so
++// "Response sent" can log it (conftamerRecvPath). Handlers can change the
++// request's own fields in place, e.g. Grafana's router strips its sub path from
++// req.URL.Path (pkg/web/macaron.go), Prometheus's pprof handler rewrites it
++// (web/web.go), and Caddy's rewrite handler sets both req.URL and
++// req.RequestURI (modules/caddyhttp/rewrite/rewrite.go); a context value under
++// an unexported key, they can't.
++func conftamerStampServer(ctx context.Context, path string) context.Context {
++	if !conftamerOn() {
++		return ctx
++	}
++	return context.WithValue(conftamerStampID(ctx), conftamerRecvPathKey, path)
++}
++
++// conftamerRecvPath is the path r's server received it with (conftamerStampServer),
++// or r.URL.Path if none was recorded.
++func conftamerRecvPath(r *Request) string {
++	if p, ok := r.Context().Value(conftamerRecvPathKey).(string); ok {
++		return p
++	}
++	return r.URL.Path
 +}
 +
 +func conftamerContext(ctx context.Context) *conftamerContextInfo {
@@ -606,7 +636,7 @@ new file mode 100644
 +	if !conftamerOn() {
 +		return r
 +	}
-+	return r.WithContext(conftamerStampID(r.Context()))
++	return r.WithContext(conftamerStampServer(r.Context(), r.URL.Path))
 +}
 +
 +// ConftamerLogRequestReceived logs "Request received" for a server outside
@@ -633,7 +663,7 @@ new file mode 100644
 +	conftamerLogAt(2, time.Now(), "Response sent", map[string]string{
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   r.Method,
-+		"req.URL.Path": r.URL.Path,
++		"req.URL.Path": conftamerRecvPath(r),
 +	}, r.Context(), nil, false, nil)
 +}
 +
@@ -668,7 +698,7 @@ diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src
  		Body:       body,
  		Trailer:    res.Trailer,
  	}).WithContext(st.ctx)
-+	req.ctx = conftamerStampIDIfOn(req.Context())
++	req.ctx = conftamerStampServer(req.Context(), req.URL.Path)
  	rw := sc.newResponseWriter(st, req)
  	return rw, req, nil
  }
@@ -692,7 +722,7 @@ diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src
 +	conftamerLog("Response sent", map[string]string{
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   rws.req.Method,
-+		"req.URL.Path": rws.req.URL.Path,
++		"req.URL.Path": conftamerRecvPath(rws.req),
 +	}, rws.req.Context(), nil, false, nil)
  	rws.writeHeader(code)
  }
@@ -705,7 +735,7 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
  
  	ctx, cancelCtx := context.WithCancel(ctx)
 -	req.ctx = ctx
-+	req.ctx = conftamerStampIDIfOn(ctx)
++	req.ctx = conftamerStampServer(ctx, req.URL.Path)
  	req.RemoteAddr = c.remoteAddr
  	req.TLS = c.tlsState
  	if body, ok := req.Body.(*body); ok {
@@ -717,7 +747,7 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
 +	conftamerLog("Response sent", map[string]string{
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   w.req.Method,
-+		"req.URL.Path": w.req.URL.Path,
++		"req.URL.Path": conftamerRecvPath(w.req),
 +	}, w.req.Context(), nil, false, nil)
 +
  	if code < 101 || code > 199 {
