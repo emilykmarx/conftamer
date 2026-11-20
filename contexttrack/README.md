@@ -23,8 +23,8 @@ Apply [`go-inlibrary.patch`](go-inlibrary.patch) to a cloned copy of Go.
 and applied the patch there.)
 
 *If running with packet captures.* To match events to packet captures (for debugging -- optional), also apply
-[`debug/go-inlibrary-conn.patch`](debug/go-inlibrary-conn.patch) on top. It records each message's
-connection (`conn`, see [Output](#output)). For captures of TLS traffic, also apply
+[`debug/go-inlibrary-conn.patch`](debug/go-inlibrary-conn.patch) on top. It records the client
+side's connections too (`conn`, see [Output](#output)). For captures of TLS traffic, also apply
 [`debug/go-keylog.patch`](debug/go-keylog.patch).
 
 ```bash
@@ -218,21 +218,36 @@ values in the same format for each call it checks (its calls output), so its mat
 joined to these events on `ancestry`; `conftamerSplitStack` in `conftamer.go` defines the format.
 
 Every event has `ts` (Unix ns). `Request sent` is logged once per `RoundTrip` call, before
-any connection is chosen.
+any connection is chosen; and by `Request.Write` (or `WriteProxy`) on a connection, for a client
+that dials and writes its request itself (e.g. client-go's SPDY `RoundTripper`, for `exec` and
+`port-forward`).
 
-With `go-inlibrary-conn.patch`, `Request sent` is instead logged once the request has a
-connection, so once per attempt (and, when an alternate protocol such as
-`golang.org/x/net/http2` takes the request, when it's handed over). `Request sent` (HTTP/1 only),
-`Request received`, `Request routed` and `Response sent` also carry `conn`: the connection
-as this end's socket sees it, e.g.
-`{"local":"10.244.1.2:47832","remote":"10.96.0.20:80","index":1}`. `index` is the request's
-position on an HTTP/1 connection (from 0); HTTP/2 server events have `h2_stream` instead.
-This is the key for matching events to packet captures
+The server side's events (`Request received`, `Request routed` and `Response sent`) carry
+`conn`: the connection as this end's socket sees it, e.g.
+`{"local":"10.96.0.20:80","remote":"10.244.1.2:47832","index":1}`, so `remote` is the
+client's address. `index` is the request's position on an HTTP/1 connection (from 0); HTTP/2
+server events have `h2_stream` instead. They also carry `user_agent`, the request's User-Agent
+header (what the client says it is, e.g. a testbed workload tagging its requests); it's not in
+`message`, so it isn't part of the message's label.
+
+`Response sent` is logged when the handler's response header is written (`WriteHeader`). A
+handler that hijacks the connection without writing one, such as a WebSocket upgrader that
+writes its own `101 Switching Protocols`, gets it from the status line it writes on the
+connection (`conftamerHijackedConn` in `conftamer.go`).
+
+With `go-inlibrary-conn.patch`, the client side's `Request sent` carries `conn` too (HTTP/1, and
+gRPC clients), and is instead logged once the request has a connection, so once per attempt
+(and, when an alternate protocol such as `golang.org/x/net/http2` takes the request, when it's
+handed over). `conn` is the key for matching events to packet captures
 (`debug/pcap_messages.py`, whose records carry the same `conn` for each end).
 
 A request sent through `http.Client` produces two `Response received` events (one from
 the transport read loop, one from `Client.do`); both analysis scripts deduplicate, keeping
-`Client.do` (contains `api_id`) if available.
+`Client.do` (contains `api_id`) if available. `Client.do` logs it with the method and path of
+the request as logged sent (a `RoundTripper` can rewrite the URL, and a redirect changes it),
+and only if one was, so in-process requests aren't messages: a `RoundTripper` that calls a
+handler directly (e.g. Grafana's client of its own API server) logs neither
+(`conftamerSentKey` in `conftamer.go`).
 
 Use `analysis/group_by_context.py` to see context groups and `analysis/message_graph.py`
 to generate the full graph.

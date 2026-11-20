@@ -26,17 +26,35 @@ diff --git a/usr/local/go/src/net/http/client.go b/home/tcr6/go-conftamer/src/ne
  	var (
  		deadline      = c.deadline()
  		reqs          []*Request
-@@ -739,6 +750,14 @@
+@@ -730,6 +741,11 @@
+ 		reqs = append(reqs, req)
+ 		var err error
+ 		var didTimeout func() bool
++		// This hop's request as logged sent: see conftamerSentKey.
++		var sent *conftamerSent
++		if conftamerOn() {
++			req.ctx, sent = conftamerWithSent(req.Context())
++		}
+ 		if resp, didTimeout, err = c.send(req, deadline); err != nil {
+ 			// c.send() always closes req.Body
+ 			reqBodyClosed = true
+@@ -739,6 +755,20 @@
  			return nil, uerr(err)
  		}
  
 +		ireq := reqs[0]
 +		// resp.Status is not logged: it only restates resp.StatusCode.
-+		conftamerLog("Response received", map[string]string{
-+			"resp.StatusCode": strconv.Itoa(resp.StatusCode),
-+			"req.Method":      ireq.Method,
-+			"req.URL.Path":    ireq.URL.Path,
-+		}, ireq.Context(), nil, true, nil)
++		// With the request as sent, and not for an in-process request (none
++		// sent): see conftamerSentKey.
++		if sent != nil {
++			if method, path, ok := sent.get(); ok {
++				conftamerLog("Response received", map[string]string{
++					"resp.StatusCode": strconv.Itoa(resp.StatusCode),
++					"req.Method":      method,
++					"req.URL.Path":    path,
++				}, ireq.Context(), nil, true, nil, nil)
++			}
++		}
 +
  		var shouldRedirect, includeBodyOnHop bool
  		redirectMethod, shouldRedirect, includeBodyOnHop = redirectBehavior(req.Method, resp, reqs[0])
@@ -45,7 +63,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,645 @@
+@@ -0,0 +1,853 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -60,6 +78,7 @@ new file mode 100644
 +	"context"
 +	"encoding/json"
 +	"fmt"
++	"io"
 +	"net"
 +	"os"
 +	"reflect"
@@ -140,18 +159,98 @@ new file mode 100644
 +	// CallChain is the full stack at the event, innermost frame first, starting
 +	// at the function that logged it.
 +	CallChain []conftamerFrame `json:"call_chain,omitempty"`
++	// Conn is the connection a request went over, on "Request received",
++	// "Request routed" and "Response sent" (server side), and, with
++	// contexttrack's debug/go-inlibrary-conn.patch, on "Request sent" (client
++	// side).
++	Conn *conftamerConnInfo `json:"conn,omitempty"`
++	// UserAgent is the request's User-Agent header, on the server side's events
++	// (with Conn): what the client says it is, e.g. a testbed's workload tagging
++	// its requests. Not part of Message, so not of the message's label.
++	UserAgent string `json:"user_agent,omitempty"`
 +}
 +
-+// conftamerEnsureServerContext gives r a context ID, if it lacks one: a request
++// conftamerConnInfo is a connection as this end's socket sees it, and which
++// message on it this is: what a packet capture at this end sees.
++type conftamerConnInfo struct {
++	Local  string `json:"local"`
++	Remote string `json:"remote"`
++	// Index: HTTP/1 only, the request's position on the connection, from 0.
++	Index *int `json:"index,omitempty"`
++	// H2Stream: HTTP/2 only (the server side, and gRPC clients; net/http's HTTP/2
++	// client doesn't know it).
++	H2Stream uint32 `json:"h2_stream,omitempty"`
++	// userAgent: the server side's request's User-Agent header, logged as the
++	// event's user_agent (conftamerEvent.UserAgent), not as part of conn.
++	userAgent string
++}
++
++// withUserAgent records r's User-Agent header in i (server side), and returns i.
++func (i *conftamerConnInfo) withUserAgent(r *Request) *conftamerConnInfo {
++	i.userAgent = r.Header.Get("User-Agent")
++	return i
++}
++
++// conftamerNewConnInfo describes c; index < 0 means none (HTTP/2).
++func conftamerNewConnInfo(c net.Conn, index int, h2Stream uint32) *conftamerConnInfo {
++	info := &conftamerConnInfo{Local: c.LocalAddr().String(), Remote: c.RemoteAddr().String(), H2Stream: h2Stream}
++	if index >= 0 {
++		info.Index = &index
++	}
++	return info
++}
++
++// The server side records a request's connection in its context, so the
++// events logged from the Request (or a shallow copy a router makes) find it.
++type conftamerConnKeyType struct{}
++
++var conftamerConnKey conftamerConnKeyType
++
++func conftamerWithConn(ctx context.Context, info *conftamerConnInfo) context.Context {
++	return context.WithValue(ctx, conftamerConnKey, info)
++}
++
++// conftamerEnsureServerContext gives r a context ID and its connection's
++// addresses (no index or stream: not known here), if it lacks them: a request
 +// built by a server outside net/http without the ConftamerServerRequest hook.
 +func conftamerEnsureServerContext(r *Request) *Request {
 +	if !conftamerOn() {
 +		return r
 +	}
-+	if _, ok := r.Context().Value(conftamerIDKey).(uint64); ok {
++	ctx := r.Context()
++	_, hasID := ctx.Value(conftamerIDKey).(uint64)
++	if hasID && conftamerServerConn(ctx) != nil {
 +		return r
 +	}
-+	return r.WithContext(conftamerStampServer(r.Context(), r.URL.Path))
++	if !hasID {
++		ctx = conftamerStampServer(ctx, r.URL.Path)
++	}
++	if conftamerServerConn(ctx) == nil {
++		if local, ok := ctx.Value(LocalAddrContextKey).(net.Addr); ok && r.RemoteAddr != "" {
++			ctx = conftamerWithConn(ctx, (&conftamerConnInfo{Local: local.String(), Remote: r.RemoteAddr}).withUserAgent(r))
++		}
++	}
++	return r.WithContext(ctx)
++}
++
++// conftamerH2LogsReceived reports whether the bundled HTTP/2 server's
++// runHandler should log "Request received" for a connection served by h: not
++// when h is net/http's own HTTP/2 server's (TLS with ALPN, or unencrypted
++// HTTP/2), which hands requests to serverHandler.ServeHTTP, which logs it.
++func conftamerH2LogsReceived(h Handler) bool {
++	switch h.(type) {
++	case initALPNRequest, unencryptedHTTP2Request:
++		return false
++	}
++	return true
++}
++
++// conftamerServerConn returns the connection a server-side request arrived on.
++// Only for server-side events: a handler's outgoing requests inherit its
++// context, but go over a different connection.
++func conftamerServerConn(ctx context.Context) *conftamerConnInfo {
++	info, _ := ctx.Value(conftamerConnKey).(*conftamerConnInfo)
++	return info
 +}
 +
 +type conftamerFrame struct {
@@ -235,6 +334,58 @@ new file mode 100644
 +		return p
 +	}
 +	return r.URL.Path
++}
++
++// conftamerHijackedConn wraps the connection Hijack returns to a handler that
++// hasn't written a header (so no "Response sent" was logged), e.g. a WebSocket
++// upgrader that writes "HTTP/1.1 101 Switching Protocols" itself: it logs
++// "Response sent" with the status code of the first line written, if that line
++// is an HTTP status line, and then only passes writes through.
++type conftamerHijackedConn struct {
++	net.Conn
++	req  *Request
++	mu   sync.Mutex
++	line []byte // the first line written so far
++	done bool
++}
++
++// conftamerMaxStatusLine bounds how much of the first write is kept looking for
++// the status line's end.
++const conftamerMaxStatusLine = 128
++
++func (c *conftamerHijackedConn) Write(p []byte) (int, error) {
++	c.mu.Lock()
++	if !c.done {
++		c.line = append(c.line, p[:min(len(p), conftamerMaxStatusLine-len(c.line))]...)
++		if i := strings.Index(string(c.line), "\r\n"); i >= 0 || len(c.line) >= conftamerMaxStatusLine {
++			c.done = true
++			if i < 0 {
++				i = len(c.line)
++			}
++			c.logStatus(string(c.line[:i]))
++			c.line = nil
++		}
++	}
++	c.mu.Unlock()
++	return c.Conn.Write(p)
++}
++
++// logStatus logs "Response sent" if line is an HTTP status line ("HTTP/1.1 101 Switching Protocols")
++func (c *conftamerHijackedConn) logStatus(line string) {
++	proto, rest, ok := strings.Cut(line, " ")
++	if !ok || !strings.HasPrefix(proto, "HTTP/") || len(rest) < 3 {
++		return
++	}
++	code, err := strconv.Atoi(rest[:3])
++	if err != nil {
++		return
++	}
++	// No caller identification: see conftamerLog.
++	conftamerLog("Response sent", map[string]string{
++		"code":         strconv.Itoa(code),
++		"req.Method":   c.req.Method,
++		"req.URL.Path": conftamerRecvPath(c.req),
++	}, c.req.Context(), nil, false, nil, conftamerServerConn(c.req.Context()))
 +}
 +
 +func conftamerContext(ctx context.Context) *conftamerContextInfo {
@@ -489,6 +640,68 @@ new file mode 100644
 +	return false
 +}
 +
++// conftamerSentKey's value (a *conftamerSent, conftamerWithSent) records the
++// "Request sent" logged with the context, so that Client.do logs "Response
++// received" only for requests that went on the wire (through net/http's
++// Transport, Request.Write on a connection, or a client outside net/http that
++// logs: ConftamerLogClientRequest), and not for an in-process RoundTripper that
++// calls a handler directly (e.g. Grafana's client of its own API server), whose
++// request isn't logged either; and with the method and path that were sent,
++// which a RoundTripper can rewrite (e.g. kube-apiserver's OIDC discovery URL)
++// and a redirect changes, so that it pairs with that request and with the
++// transport's own "Response received" (analysis' dedup_responses).
++type conftamerSentKeyType struct{}
++
++var conftamerSentKey conftamerSentKeyType
++
++type conftamerSent struct {
++	mu           sync.Mutex
++	sent         bool
++	method, path string // the last request logged as sent
++}
++
++// conftamerWithSent returns ctx with a fresh conftamerSent under conftamerSentKey, and it.
++func conftamerWithSent(ctx context.Context) (context.Context, *conftamerSent) {
++	s := new(conftamerSent)
++	return context.WithValue(ctx, conftamerSentKey, s), s
++}
++
++func (s *conftamerSent) record(method, path string) {
++	s.mu.Lock()
++	s.sent, s.method, s.path = true, method, path
++	s.mu.Unlock()
++}
++
++// get returns the method and path last logged as sent, and whether any was.
++func (s *conftamerSent) get() (method, path string, ok bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.method, s.path, s.sent
++}
++
++// conftamerLogRequestWrite logs "Request sent" for r written by Request.Write
++// or WriteProxy, if w is a connection (not, e.g., a buffer being dumped to): a
++// client that dials and writes its request itself, such as client-go's SPDY
++// RoundTripper (kubectl exec and port-forward, kube-apiserver to the kubelet).
++func conftamerLogRequestWrite(r *Request, w io.Writer) {
++	if !conftamerOn() || r.URL == nil {
++		return
++	}
++	if _, ok := w.(net.Conn); !ok {
++		return
++	}
++	host := r.Host
++	if host == "" {
++		host = r.URL.Host
++	}
++	conftamerLogAt(2, time.Now(), "Request sent", map[string]string{
++		"req.Method":       r.Method,
++		"req.URL.Host":     host,
++		"req.URL.Path":     r.URL.Path,
++		"req.URL.RawQuery": r.URL.RawQuery,
++	}, r.Context(), &conftamerRequestID{Method: r.Method, Host: host, Path: r.URL.Path}, true, nil, nil)
++}
++
 +// --- logging entry point -----------------------------------------------
 +
 +// conftamerLog records one HTTP event. ctx is the context with ID used for correlation.
@@ -496,7 +709,7 @@ new file mode 100644
 +// handler (non-nil only for "Request received" and "Request routed") is the not-yet-invoked
 +// Handler about to serve the request — when set, it's used instead of a stack walk, since
 +// the application handler isn't on the stack yet at that log point, and its name is
-+// recorded as Handler.
++// recorded as Handler. conn (may be nil) is the connection the message went over.
 +//
 +// "Response sent" deliberately does NOT identify a caller: at the point a response is
 +// written, the stack holds whatever the handler last called (fmt.Fprintln,
@@ -505,15 +718,20 @@ new file mode 100644
 +// analysis (contexttrack/analysis/message_graph.py) recovers api_id/handler by matching
 +// each response back to the "Request received" it answers, and the matched route pattern
 +// from the "Request routed" events logged by conftamerLogRouted.
-+func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any) {
-+	conftamerLogAt(2, time.Now(), kind, msg, ctx, reqID, withCaller, handler)
++func conftamerLog(kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any, conn *conftamerConnInfo) {
++	conftamerLogAt(2, time.Now(), kind, msg, ctx, reqID, withCaller, handler, conn)
 +}
 +
 +// conftamerLogAt is conftamerLog for an event that happened at ts, logged by
 +// the function skip frames up (1: conftamerLogAt's caller).
-+func conftamerLogAt(skip int, ts time.Time, kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any) {
++func conftamerLogAt(skip int, ts time.Time, kind string, msg map[string]string, ctx context.Context, reqID *conftamerRequestID, withCaller bool, handler any, conn *conftamerConnInfo) {
 +	if !conftamerOn() {
 +		return
++	}
++	if kind == "Request sent" && ctx != nil {
++		if sent, ok := ctx.Value(conftamerSentKey).(*conftamerSent); ok {
++			sent.record(msg["req.Method"], msg["req.URL.Path"])
++		}
 +	}
 +
 +	_, file, line, _ := runtime.Caller(skip)
@@ -527,6 +745,10 @@ new file mode 100644
 +		Line:        line,
 +		Message:     msg,
 +		Context:     conftamerContext(ctx),
++		Conn:        conn,
++	}
++	if conn != nil {
++		ev.UserAgent = conn.userAgent
 +	}
 +
 +	if withCaller {
@@ -581,7 +803,7 @@ new file mode 100644
 +		"pattern":      pattern,
 +		"req.Method":   r.Method,
 +		"req.URL.Path": r.URL.Path,
-+	}, r.Context(), nil, handler != nil, handler)
++	}, r.Context(), nil, handler != nil, handler, conftamerServerConn(r.Context()))
 +}
 +
 +// ConftamerLogRouted records a route pattern matched by a router outside this
@@ -615,7 +837,7 @@ new file mode 100644
 +			ctx = r.Context()
 +		}
 +	}
-+	conftamerLog(kind, msg, ctx, nil, false, nil)
++	conftamerLog(kind, msg, ctx, nil, false, nil, nil)
 +}
 +
 +// --- hooks for HTTP implementations outside net/http ---------------------
@@ -630,13 +852,17 @@ new file mode 100644
 +}
 +
 +// ConftamerServerRequest gives a request built outside net/http the context
-+// ID that conn.readRequest gives net/http's. c (the connection it arrived on)
-+// and h2Stream (its HTTP/2 stream) are recorded only with go-inlibrary-conn.patch.
++// ID and connection that conn.readRequest gives net/http's: c is the
++// connection it arrived on, h2Stream its HTTP/2 stream.
 +func ConftamerServerRequest(r *Request, c net.Conn, h2Stream uint32) *Request {
 +	if !conftamerOn() {
 +		return r
 +	}
-+	return r.WithContext(conftamerStampServer(r.Context(), r.URL.Path))
++	ctx := conftamerStampServer(r.Context(), r.URL.Path)
++	if c != nil {
++		ctx = conftamerWithConn(ctx, conftamerNewConnInfo(c, -1, h2Stream).withUserAgent(r))
++	}
++	return r.WithContext(ctx)
 +}
 +
 +// ConftamerLogRequestReceived logs "Request received" for a server outside
@@ -651,7 +877,7 @@ new file mode 100644
 +		"req.Method":       r.Method,
 +		"req.URL.Path":     r.URL.Path,
 +		"req.URL.RawQuery": r.URL.RawQuery,
-+	}, r.Context(), nil, true, handler)
++	}, r.Context(), nil, true, handler, conftamerServerConn(r.Context()))
 +}
 +
 +// ConftamerLogResponseSent logs "Response sent" for a server outside net/http.
@@ -664,12 +890,12 @@ new file mode 100644
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   r.Method,
 +		"req.URL.Path": conftamerRecvPath(r),
-+	}, r.Context(), nil, false, nil)
++	}, r.Context(), nil, false, nil, conftamerServerConn(r.Context()))
 +}
 +
 +// ConftamerLogClientRequest logs "Request sent" for a client outside net/http
 +// (grpc-go's). Its connection (local, remote) and HTTP/2 stream (h2Stream) are
-+// recorded only with go-inlibrary-conn.patch.
++// recorded only with contexttrack's debug/go-inlibrary-conn.patch.
 +func ConftamerLogClientRequest(ctx context.Context, method, host, path string, local, remote net.Addr, h2Stream uint32) {
 +	if !conftamerOn() {
 +		return
@@ -679,7 +905,7 @@ new file mode 100644
 +		"req.URL.Host":     host,
 +		"req.URL.Path":     path,
 +		"req.URL.RawQuery": "",
-+	}, ctx, &conftamerRequestID{Method: method, Host: host, Path: path}, true, nil)
++	}, ctx, &conftamerRequestID{Method: method, Host: host, Path: path}, true, nil, nil)
 +}
 +
 +// ConftamerLogClientResponse logs "Response received" for a client outside
@@ -689,32 +915,39 @@ new file mode 100644
 +		"resp.StatusCode": strconv.Itoa(code),
 +		"req.Method":      method,
 +		"req.URL.Path":    path,
-+	}, ctx, nil, false, nil)
++	}, ctx, nil, false, nil, nil)
 +}
 diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
 --- a/usr/local/go/src/net/http/h2_bundle.go
 +++ b/home/tcr6/go-conftamer/src/net/http/h2_bundle.go
-@@ -6314,6 +6314,7 @@
+@@ -6314,6 +6314,10 @@
  		Body:       body,
  		Trailer:    res.Trailer,
  	}).WithContext(st.ctx)
 +	req.ctx = conftamerStampServer(req.Context(), req.URL.Path)
++	if conftamerOn() {
++		req.ctx = conftamerWithConn(req.ctx, conftamerNewConnInfo(sc.conn, -1, st.id).withUserAgent(req))
++	}
  	rw := sc.newResponseWriter(st, req)
  	return rw, req, nil
  }
-@@ -6385,6 +6386,11 @@
+@@ -6385,6 +6389,15 @@
  
  // Run on its own goroutine.
  func (sc *http2serverConn) runHandler(rw *http2responseWriter, req *Request, handler func(ResponseWriter, *Request)) {
-+	conftamerLog("Request received", map[string]string{
-+		"req.Method":       req.Method,
-+		"req.URL.Path":     req.URL.Path,
-+		"req.URL.RawQuery": req.URL.RawQuery,
-+	}, req.Context(), nil, true, handler)
++	// (not for net/http's own HTTP/2 server: its handler, serverHandler, logs
++	// it, with the Server's Handler; see conftamerH2LogsReceived)
++	if conftamerH2LogsReceived(sc.handler) {
++		conftamerLog("Request received", map[string]string{
++			"req.Method":       req.Method,
++			"req.URL.Path":     req.URL.Path,
++			"req.URL.RawQuery": req.URL.RawQuery,
++		}, req.Context(), nil, true, handler, conftamerServerConn(req.Context()))
++	}
  	defer sc.sendServeMsg(http2handlerDoneMsg)
  	didPanic := true
  	defer func() {
-@@ -6940,6 +6946,12 @@
+@@ -6940,6 +6953,12 @@
  	if rws == nil {
  		panic("WriteHeader called after Handler finished")
  	}
@@ -723,23 +956,55 @@ diff --git a/usr/local/go/src/net/http/h2_bundle.go b/home/tcr6/go-conftamer/src
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   rws.req.Method,
 +		"req.URL.Path": conftamerRecvPath(rws.req),
-+	}, rws.req.Context(), nil, false, nil)
++	}, rws.req.Context(), nil, false, nil, conftamerServerConn(rws.req.Context()))
  	rws.writeHeader(code)
+ }
+ 
+diff --git a/usr/local/go/src/net/http/request.go b/home/tcr6/go-conftamer/src/net/http/request.go
+--- a/usr/local/go/src/net/http/request.go
++++ b/home/tcr6/go-conftamer/src/net/http/request.go
+@@ -559,6 +559,7 @@
+ // hasn't been set to "identity", Write adds "Transfer-Encoding:
+ // chunked" to the header. Body is closed after it is sent.
+ func (r *Request) Write(w io.Writer) error {
++	conftamerLogRequestWrite(r, w)
+ 	return r.write(w, false, nil, nil)
+ }
+ 
+@@ -569,6 +570,7 @@
+ // In either case, WriteProxy also writes a Host header, using
+ // either r.Host or r.URL.Host.
+ func (r *Request) WriteProxy(w io.Writer) error {
++	conftamerLogRequestWrite(r, w)
+ 	return r.write(w, true, nil, nil)
  }
  
 diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/net/http/server.go
 --- a/usr/local/go/src/net/http/server.go
 +++ b/home/tcr6/go-conftamer/src/net/http/server.go
-@@ -1038,7 +1038,7 @@
+@@ -252,6 +252,8 @@
+ 
+ // A conn represents the server side of an HTTP connection.
+ type conn struct {
++	conftamerReqs int // requests read from this connection so far
++
+ 	// server is the server on which the connection arrived.
+ 	// Immutable; never nil.
+ 	server *Server
+@@ -1038,7 +1040,11 @@
  	delete(req.Header, "Host")
  
  	ctx, cancelCtx := context.WithCancel(ctx)
 -	req.ctx = ctx
 +	req.ctx = conftamerStampServer(ctx, req.URL.Path)
++	if conftamerOn() {
++		req.ctx = conftamerWithConn(req.ctx, conftamerNewConnInfo(c.rwc, c.conftamerReqs, 0).withUserAgent(req))
++		c.conftamerReqs++
++	}
  	req.RemoteAddr = c.remoteAddr
  	req.TLS = c.tlsState
  	if body, ok := req.Body.(*body); ok {
-@@ -1159,6 +1159,13 @@
+@@ -1159,6 +1165,13 @@
  	}
  	checkWriteHeaderCode(code)
  
@@ -748,12 +1013,25 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
 +		"code":         strconv.Itoa(code),
 +		"req.Method":   w.req.Method,
 +		"req.URL.Path": conftamerRecvPath(w.req),
-+	}, w.req.Context(), nil, false, nil)
++	}, w.req.Context(), nil, false, nil, conftamerServerConn(w.req.Context()))
 +
  	if code < 101 || code > 199 {
  		// Sending a 100 Continue or any non-1xx header disables the
  		// automatically-sent 100 Continue from Request.Body.Read.
-@@ -2821,9 +2828,12 @@
+@@ -2217,6 +2230,12 @@
+ 	if err == nil {
+ 		putBufioWriter(w.w)
+ 		w.w = nil
++		// A handler that writes its own response on the connection: see
++		// conftamerHijackedConn. (Its buffered writer writes through it too.)
++		if conftamerOn() && !w.wroteHeader {
++			rwc = &conftamerHijackedConn{Conn: rwc, req: w.req}
++			buf.Writer.Reset(rwc)
++		}
+ 	}
+ 	return rwc, buf, err
+ }
+@@ -2821,9 +2840,12 @@
  	}
  	var h Handler
  	if use121 {
@@ -767,18 +1045,18 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
  	}
  	h.ServeHTTP(w, r)
  }
-@@ -3308,6 +3318,15 @@
+@@ -3308,6 +3330,15 @@
  		handler = globalOptionsHandler{}
  	}
  
 +	// A server outside net/http (golang.org/x/net/http2) builds its own Request:
-+	// give it the context ID conn.readRequest would have.
++	// give it the context ID and connection conn.readRequest would have.
 +	req = conftamerEnsureServerContext(req)
 +	conftamerLog("Request received", map[string]string{
 +		"req.Method":       req.Method,
 +		"req.URL.Path":     req.URL.Path,
 +		"req.URL.RawQuery": req.URL.RawQuery,
-+	}, req.Context(), nil, true, handler)
++	}, req.Context(), nil, true, handler, conftamerServerConn(req.Context()))
 +
  	handler.ServeHTTP(rw, req)
  }
@@ -795,7 +1073,7 @@ diff --git a/usr/local/go/src/net/http/transport.go b/home/tcr6/go-conftamer/src
 +		"req.URL.Host":     req.URL.Host,
 +		"req.URL.Path":     req.URL.Path,
 +		"req.URL.RawQuery": req.URL.RawQuery,
-+	}, ctx, &conftamerRequestID{Method: req.Method, Host: req.URL.Host, Path: req.URL.Path}, true, nil)
++	}, ctx, &conftamerRequestID{Method: req.Method, Host: req.URL.Host, Path: req.URL.Path}, true, nil, nil)
  	if req.Header == nil {
  		req.closeBody()
  		return nil, errors.New("http: nil Request.Header")
