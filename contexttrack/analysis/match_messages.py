@@ -10,7 +10,9 @@ Each message is reduced to a deduplicated type:
 Request types pair when api_id and method are equal and the paths are equal
 ("matched-exact") or the receiver's route pattern is one it received the
 sender's path under ("matched-pattern").
-Host is used for reference/debugging, not matching.
+Host is used for reference/debugging, not matching, except that with
+loopback_within (match_requests; not from the command line) a component's
+requests pair with its own only if their host is loopback.
 Response types pair when api_id and code are equal and the requests they
 answer were paired.
 Types with no match get a row with the other side blank.
@@ -209,6 +211,13 @@ class Side:
         self.paths: dict[tuple, set] = defaultdict(set)  # concrete paths per type
         self.first: dict[tuple, int] = {}  # earliest and latest event timestamp (ns) per type
         self.last: dict[tuple, int] = {}
+        # From the server side's conn (received requests): the clients' IPs per
+        # type, and the types some message of which came from the receiver's own
+        # IP (remote IP == local IP: the component sent it to itself)
+        self.client_ips: dict[tuple, set] = defaultdict(set)
+        # The clients as (IP, User-Agent) pairs (the server side's user_agent)
+        self.client_agents: dict[tuple, set] = defaultdict(set)
+        self.self_sent: set[tuple] = set()
 
     def add(self, typ: tuple, comp: str, path: str | None = None, ts: int | None = None,
             node: str = "", conn: dict | None = None) -> None:
@@ -224,9 +233,31 @@ class Side:
             self.first[typ] = min(ts, self.first.get(typ, ts))
             self.last[typ] = max(ts, self.last.get(typ, ts))
 
+    def add_server_conn(self, typ: tuple, conn: dict | None, user_agent: str | None = None) -> None:
+        """Records a received request's connection (its event's conn): the
+        client's IP, and whether it is the receiver's own. A loopback IP isn't:
+        a port-forward's and a command's in the container (kubectl exec) come
+        from 127.0.0.1 to 127.0.0.1 too (and a component's own loopback
+        requests pair by their host: match_requests)."""
+        if not conn or not conn.get("remote"):
+            return
+        remote = _ip(conn["remote"])
+        self.client_ips[typ].add(remote)
+        self.client_agents[typ].add((remote, user_agent or ""))
+        if conn.get("local") and _ip(conn["local"]) == remote and not is_loopback(remote):
+            self.self_sent.add(typ)
 
-def collect(path: Path, sides: dict[str, Side]) -> None:
-    """Add the types of every message in one events file to `sides`."""
+
+def _ip(addr: str) -> str:
+    """'10.0.0.1:80' -> '10.0.0.1', '[::1]:80' -> '::1'"""
+    host = addr.rsplit(":", 1)[0] if addr.count(":") == 1 or addr.startswith("[") else addr
+    return host.strip("[]")
+
+
+def collect(path: Path, sides: dict[str, Side], on_message=None) -> None:
+    """Add the types of every message in one events file to `sides`.
+    on_message(side name, type, event), if given, is called for each message
+    event with the type it was added as."""
     comp = component(path)
     # <node>/pods/<pod>.jsonl or <node>/<process>.jsonl, as deploy.sh collects them
     node = path.parent.parent.name if path.parent.name == "pods" else path.parent.name
@@ -243,10 +274,13 @@ def collect(path: Path, sides: dict[str, Side]) -> None:
         group = (ev.get("pid"), (ev.get("context") or {}).get("context_id"))
         if kind == "Request sent":
             sent[group].append(ev)
-            sides["snd_req"].add(_sent_req_type(ev), comp, ts=ev.get("ts"), node=node, conn=ev.get("conn"))
+            typ = _sent_req_type(ev)
+            sides["snd_req"].add(typ, comp, ts=ev.get("ts"), node=node, conn=ev.get("conn"))
         elif kind == "Request received":
             recvd[group].append(ev)
-            sides["rcv_req"].add(_recvd_req_type(ev), comp, msg.get("req.URL.Path"), ev.get("ts"))
+            typ = _recvd_req_type(ev)
+            sides["rcv_req"].add(typ, comp, msg.get("req.URL.Path"), ev.get("ts"))
+            sides["rcv_req"].add_server_conn(typ, ev.get("conn"), ev.get("user_agent"))
         elif kind == "Response sent":
             # Match on method and path, else the only request in the context:
             # handlers may rewrite the path before responding (e.g. Prometheus serveDebug)
@@ -254,7 +288,9 @@ def collect(path: Path, sides: dict[str, Side]) -> None:
             if not reqs and len(recvd[group]) == 1:
                 reqs = recvd[group]
             req = _recvd_req_type(reqs[-1]) if reqs else _NO_REQ
-            sides["snd_resp"].add((req[0], msg.get("code", ""), req), comp, ts=ev.get("ts"))
+            typ = (req[0], msg.get("code", ""), req)
+            sides["snd_resp"].add(typ, comp, ts=ev.get("ts"))
+            sides["snd_resp"].add_server_conn(typ, ev.get("conn"), ev.get("user_agent"))
         elif kind == "Response received":
             reqs = [r for r in sent[group] if _req_identity(r) == _req_identity(ev)]
             req = _sent_req_type(reqs[-1]) if reqs else _NO_REQ
@@ -264,18 +300,50 @@ def collect(path: Path, sides: dict[str, Side]) -> None:
             # own api_id can name a wrapper (e.g. golang.org for parca), and
             # transport-only responses (direct RoundTrip) carry none
             api_id = req[0] or ev.get("api_id", "")
-            sides["rcv_resp"].add((api_id, msg.get("resp.StatusCode", ""), req), comp, ts=ev.get("ts"),
-                                  node=node, conn=conn)
+            typ = (api_id, msg.get("resp.StatusCode", ""), req)
+            sides["rcv_resp"].add(typ, comp, ts=ev.get("ts"), node=node, conn=conn)
+        else:
+            continue
+        if on_message:
+            on_message(_SIDE_OF[kind], typ, ev)
 
 
-def match_requests(snd: Side, rcv: Side) -> list[tuple]:
-    """(status, sender type, receiver type) for every request type."""
+# Event kind -> the Side its types are added to (collect)
+_SIDE_OF = {"Request sent": "snd_req", "Request received": "rcv_req",
+            "Response sent": "snd_resp", "Response received": "rcv_resp"}
+
+
+def is_loopback(host: str) -> bool:
+    """Whether a request's host (host[:port], IPv6 in brackets) is this machine:
+    127.0.0.0/8, ::1 or localhost."""
+    h = _ip(host).lower()
+    return h == "localhost" or h == "::1" or h.startswith("127.")
+
+
+def match_requests(snd: Side, rcv: Side, loopback_within: bool = False) -> list[tuple]:
+    """(status, sender type, receiver type) for every request type.
+
+    loopback_within: a sender and a receiver type logged only by the same
+    component pair only if the request's host is loopback (is_loopback), or
+    the receiver logged the type from its own IP (Side.self_sent: needs the
+    server side's conn): for components that each are one process, which
+    sends to itself only those ways (e.g. Prometheus scraping itself at its
+    pod IP).
+    Without it, a proxy's forwarded request pairs with the request it received
+    (both carry the proxy's api_id and route). Off by default: a component
+    named after a container can be several pods (component), which do send to
+    each other."""
     by_key = defaultdict(list)  # (api_id, method) -> receiver types
     for r in rcv.n:
         by_key[r[:2]].append(r)
     rows, matched = [], set()
     for s in snd.n:
         cands = by_key[s[:2]]
+        if loopback_within and not is_loopback(s[2]):
+            # (types can span components: unless both are the same one, some
+            # sender component differs from some receiver component)
+            cands = [r for r in cands if r in rcv.self_sent
+                     or not (len(snd.components[s]) == 1 and snd.components[s] == rcv.components[r])]
         # A receiver can log the same request under its path and, when routed,
         # under its pattern (e.g. kube-apiserver's leases), so take both. A
         # pattern counts only if the receiver logged this path under it: a
@@ -313,7 +381,7 @@ FIELDS = ["message", "status",
           "snd_api_id", "snd_method", "snd_host", "snd_path", "snd_code", "snd_n",
           "rcv_api_id", "rcv_method", "rcv_host", "rcv_path", "rcv_code", "rcv_n",
           "snd_components", "rcv_components", "example_paths",
-          "same_path_other_api_ids", "server_paths",
+          "same_path_other_api_ids", "server_paths", "client_ips", "client_agents",
           "snd_first_ts", "snd_last_ts", "rcv_first_ts", "rcv_last_ts",
           "snd_type_id", "rcv_type_id"]
 
@@ -343,8 +411,9 @@ def _other_api_ids(typ: tuple, others: Side, is_resp: bool) -> str:
     return ";".join(sorted(i or "(none)" for i in ids))
 
 
-def build_rows(sides: dict[str, Side]) -> list[dict]:
-    req_rows = match_requests(sides["snd_req"], sides["rcv_req"])
+def build_rows(sides: dict[str, Side], loopback_within: bool = False) -> list[dict]:
+    """loopback_within: see match_requests"""
+    req_rows = match_requests(sides["snd_req"], sides["rcv_req"], loopback_within)
     req_pairs = {(s, r) for status, s, r in req_rows if status.startswith("matched")}
     resp_rows = match_responses(sides["snd_resp"], sides["rcv_resp"], req_pairs)
 
@@ -365,6 +434,15 @@ def build_rows(sides: dict[str, Side]) -> list[dict]:
             server_req = (s[2] if s else None) if is_resp else r
             if server_req is not None:
                 row["server_paths"] = ";".join(sorted(sides["rcv_req"].paths[server_req]))
+                # The clients' IPs (the server side's conn): of a response type, those
+                # its responses went to; else those the request type came from
+                ips = (sides["snd_resp"].client_ips[s] if is_resp and s else set()) \
+                    or sides["rcv_req"].client_ips[server_req]
+                row["client_ips"] = ";".join(sorted(ips))
+                # The same clients with their User-Agents: JSON [[ip, user_agent], ...]
+                agents = (sides["snd_resp"].client_agents[s] if is_resp and s else set()) \
+                    or sides["rcv_req"].client_agents[server_req]
+                row["client_agents"] = json.dumps(sorted(agents)) if agents else ""
             if status == "unmatched-sender":
                 row["same_path_other_api_ids"] = _other_api_ids(s, rcv, is_resp)
             elif status == "unmatched-receiver":
