@@ -63,7 +63,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,853 @@
+@@ -0,0 +1,856 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -420,6 +420,9 @@ new file mode 100644
 +	"k8s.io/apiserver/pkg/server/mux":                               true,
 +	"github.com/grafana/grafana/pkg/web":                            true,
 +	"google.golang.org/grpc":                                        true,
++	// Prometheus' HTTP client config's RoundTrippers (authorization, TLS, oauth2, ...), which wrap other libraries'
++	// clients too (e.g. client-go's, in Prometheus' Kubernetes service discovery)
++	"github.com/prometheus/common/config": false,
 +}
 +
 +func conftamerIsHTTPLayer(pkg string) bool {

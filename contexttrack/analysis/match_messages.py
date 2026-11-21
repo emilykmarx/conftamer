@@ -43,6 +43,7 @@ _RUNTIME_PLUMBING = {
     "github.com/prometheus/common/route": True, "github.com/emicklei/go-restful": True,
     "github.com/gorilla/mux": True, "k8s.io/apiserver/pkg/server/mux": True,
     "github.com/grafana/grafana/pkg/web": True, "google.golang.org/grpc": True,
+    "github.com/prometheus/common/config": False,
 }
 # Plumbing the runtime doesn't skip, so its "Request sent" events name it as
 # their api_id: gRPC client interceptors (metrics, tracing). Skipped here using
@@ -328,7 +329,13 @@ def match_requests(snd: Side, rcv: Side, loopback_within: bool = False) -> list[
     the receiver logged the type from its own IP (Side.self_sent: needs the
     server side's conn): for components that each are one process, which
     sends to itself only those ways (e.g. Prometheus scraping itself at its
-    pod IP).
+    pod IP). And a request to a loopback host pairs only with its own
+    component: loopback doesn't leave the sender's network namespace, so no
+    other component received it. Except that components sharing a network
+    namespace (host-network pods on the same node, e.g. kube-apiserver and
+    etcd on the control plane) do reach each other over loopback: so instead
+    of dropping such a pair, this raises (loopback_cross_component), until
+    that case is handled.
     Without it, a proxy's forwarded request pairs with the request it received
     (both carry the proxy's api_id and route). Off by default: a component
     named after a container can be several pods (component), which do send to
@@ -351,6 +358,10 @@ def match_requests(snd: Side, rcv: Side, loopback_within: bool = False) -> list[
         hits = [("matched-exact", r) for r in cands if r[3] == s[3]]
         hits += [("matched-pattern", r) for r in cands if r[3] != s[3] and (
             s[3] in rcv.paths[r] if rcv.paths[r] else pattern_matches(r[3], s[3]))]
+        if loopback_within and is_loopback(s[2]):
+            other = [r for _, r in hits if rcv.components[r] != snd.components[s]]
+            if other:
+                loopback_cross_component(s, snd, other, rcv)
         for status, r in hits:
             rows.append((status, s, r))
             matched.add(r)
@@ -358,6 +369,23 @@ def match_requests(snd: Side, rcv: Side, loopback_within: bool = False) -> list[
             rows.append(("unmatched-sender", s, None))
     rows += [("unmatched-receiver", None, r) for r in rcv.n if r not in matched]
     return rows
+
+
+def loopback_cross_component(s: tuple, snd: Side, others: list, rcv: Side) -> None:
+    """A request to a loopback host (s) would pair with receiver types another
+    component logged: match_requests' loopback_within rule. Raises rather than
+    deciding, since both cases happen:
+    - the components share a network namespace (host-network pods on one
+      node, e.g. etcd added as a module next to kube-apiserver): a real pair,
+      which loopback_within should then allow (e.g. from the pods' hostNetwork
+      and node, in the testbed's address snapshot);
+    - they don't: a false pair, from made-up api_ids that are too broad (e.g.
+      an --api-ids line covering a component's requests to itself)."""
+    raise RuntimeError(
+        f"request to loopback host {s[2]!r} ({s[1]} {s[3]}, api_id {s[0]!r}), sent by "
+        f"{sorted(snd.components[s])}, would pair with types received by "
+        f"{sorted(set().union(*(rcv.components[r] for r in others)))}: loopback reaches another component only if "
+        "they share a network namespace (host network on one node); see match_requests' loopback_within")
 
 
 def match_responses(snd: Side, rcv: Side, req_pairs: set[tuple]) -> list[tuple]:
