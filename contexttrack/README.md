@@ -230,6 +230,16 @@ server events have `h2_stream` instead. They also carry `user_agent`, the reques
 header (what the client says it is, e.g. a testbed workload tagging its requests); it's not in
 `message`, so it isn't part of the message's label.
 
+While a handler serves a request, its goroutine carries pprof labels naming the request:
+`conftamer.request` (its `context_id`) and `conftamer.request_goroutine` (the goroutine that started
+serving it). Goroutines the handler starts inherit them. argmatch reads them to stamp each call it
+reports with the request being handled, which attributes calls in a handler's frames (gone from the
+stack by the time `Response sent` is logged) to the request (`conftamerLabelRequest` in
+`conftamer.go`). net/http's own server sets them around the handler and restores the goroutine's
+previous labels afterwards. On the [`golang.org/x/net/http2` server](#golangorgxnethttp2-server),
+they're set on the stream's handler goroutine without being added to the handler's request
+context, so a handler's own `pprof.Do` drops them inside its function.
+
 `Response sent` is logged when the handler's response header is written (`WriteHeader`). A
 handler that hijacks the connection without writing one, such as a WebSocket upgrader that
 writes its own `101 Switching Protocols`, gets it from the status line it writes on the

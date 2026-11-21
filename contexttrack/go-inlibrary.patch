@@ -63,7 +63,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,856 @@
+@@ -0,0 +1,895 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -83,11 +83,13 @@ new file mode 100644
 +	"os"
 +	"reflect"
 +	"runtime"
++	"runtime/pprof"
 +	"strconv"
 +	"strings"
 +	"sync"
 +	"sync/atomic"
 +	"time"
++	"unsafe"
 +)
 +
 +var (
@@ -243,6 +245,40 @@ new file mode 100644
 +		return false
 +	}
 +	return true
++}
++
++// --- current request (goroutine labels) -----------------------------------
++//
++// While a handler serves a request, its goroutine carries pprof labels naming
++// the request: conftamer.request (its context ID, as events log it) and
++// conftamer.request_goroutine (the goroutine that set them; a goroutine the
++// handler starts inherits them). argmatch's rt reads them to stamp each call
++// with the request its goroutine is handling. They're also in the handler's
++// request context, so a handler's pprof.Do keeps them.
++
++//go:linkname conftamerGetProfLabel runtime/pprof.runtime_getProfLabel
++func conftamerGetProfLabel() unsafe.Pointer
++
++//go:linkname conftamerSetProfLabel runtime/pprof.runtime_setProfLabel
++func conftamerSetProfLabel(labels unsafe.Pointer)
++
++// conftamerLabelRequest labels the calling goroutine with r's context ID (see
++// above) and returns r with the labels in its context, and a function that
++// restores the goroutine's previous labels.
++func conftamerLabelRequest(r *Request) (*Request, func()) {
++	if !conftamerOn() {
++		return r, func() {}
++	}
++	id, ok := r.Context().Value(conftamerIDKey).(uint64)
++	if !ok {
++		return r, func() {}
++	}
++	prev := conftamerGetProfLabel()
++	ctx := pprof.WithLabels(r.Context(), pprof.Labels(
++		"conftamer.request", "id:"+strconv.FormatUint(id, 10),
++		"conftamer.request_goroutine", strconv.Itoa(conftamerGoID())))
++	pprof.SetGoroutineLabels(ctx)
++	return r.WithContext(ctx), func() { conftamerSetProfLabel(prev) }
 +}
 +
 +// conftamerServerConn returns the connection a server-side request arrived on.
@@ -881,6 +917,9 @@ new file mode 100644
 +		"req.URL.Path":     r.URL.Path,
 +		"req.URL.RawQuery": r.URL.RawQuery,
 +	}, r.Context(), nil, true, handler, conftamerServerConn(r.Context()))
++	// The goroutine runs this one handler (x/net's runHandler), so its labels
++	// needn't be restored; the handler's own request context doesn't get them.
++	conftamerLabelRequest(r)
 +}
 +
 +// ConftamerLogResponseSent logs "Response sent" for a server outside net/http.
@@ -1048,7 +1087,7 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
  	}
  	h.ServeHTTP(w, r)
  }
-@@ -3308,6 +3330,15 @@
+@@ -3308,6 +3330,17 @@
  		handler = globalOptionsHandler{}
  	}
  
@@ -1060,6 +1099,8 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
 +		"req.URL.Path":     req.URL.Path,
 +		"req.URL.RawQuery": req.URL.RawQuery,
 +	}, req.Context(), nil, true, handler, conftamerServerConn(req.Context()))
++	req, restore := conftamerLabelRequest(req)
++	defer restore()
 +
  	handler.ServeHTTP(rw, req)
  }
