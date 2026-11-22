@@ -63,7 +63,7 @@ diff --git a/home/tcr6/go-conftamer/src/net/http/conftamer.go b/home/tcr6/go-con
 new file mode 100644
 --- /dev/null
 +++ b/home/tcr6/go-conftamer/src/net/http/conftamer.go
-@@ -0,0 +1,856 @@
+@@ -0,0 +1,927 @@
 +// ConfTamer instrumentation embedded in net/http.
 +//
 +// At a handful of HTTP funnel points, records the message, resolves
@@ -168,6 +168,10 @@ new file mode 100644
 +	// (with Conn): what the client says it is, e.g. a testbed's workload tagging
 +	// its requests. Not part of Message, so not of the message's label.
 +	UserAgent string `json:"user_agent,omitempty"`
++	// KubectlCommand is the request's Kubectl-Command header, on the server
++	// side's events (with Conn): the kubectl command that sent it (e.g. "kubectl
++	// patch"), which kubectl's User-Agent doesn't say. Not part of Message.
++	KubectlCommand string `json:"kubectl_command,omitempty"`
 +}
 +
 +// conftamerConnInfo is a connection as this end's socket sees it, and which
@@ -180,14 +184,26 @@ new file mode 100644
 +	// H2Stream: HTTP/2 only (the server side, and gRPC clients; net/http's HTTP/2
 +	// client doesn't know it).
 +	H2Stream uint32 `json:"h2_stream,omitempty"`
-+	// userAgent: the server side's request's User-Agent header, logged as the
-+	// event's user_agent (conftamerEvent.UserAgent), not as part of conn.
-+	userAgent string
++	// userAgent, kubectlCommand: the server side's request's User-Agent and
++	// Kubectl-Command headers, logged as the event's user_agent and
++	// kubectl_command (conftamerEvent), not as part of conn.
++	userAgent      string
++	kubectlCommand string
 +}
 +
-+// withUserAgent records r's User-Agent header in i (server side), and returns i.
++// withUserAgent records r's User-Agent and Kubectl-Command headers in i (server
++// side), and returns i.
 +func (i *conftamerConnInfo) withUserAgent(r *Request) *conftamerConnInfo {
-+	i.userAgent = r.Header.Get("User-Agent")
++	return i.withHeaders(r.Header.Get)
++}
++
++// withHeaders is withUserAgent for a request's headers as header (a lookup by
++// name; nil: none), for servers without an *http.Request.
++func (i *conftamerConnInfo) withHeaders(header func(string) string) *conftamerConnInfo {
++	if header != nil {
++		i.userAgent = header("User-Agent")
++		i.kubectlCommand = header("Kubectl-Command")
++	}
 +	return i
 +}
 +
@@ -752,6 +768,7 @@ new file mode 100644
 +	}
 +	if conn != nil {
 +		ev.UserAgent = conn.userAgent
++		ev.KubectlCommand = conn.kubectlCommand
 +	}
 +
 +	if withCaller {
@@ -798,15 +815,15 @@ new file mode 100644
 +// as for "Request received": a server whose top-level Handler is a ServeMux gets no
 +// API ID there (net/http is an HTTP-layer package), but the handler the mux
 +// dispatches to is the application's.
-+func conftamerLogRouted(pattern string, r *Request, handler any) {
++func conftamerLogRouted(ctx context.Context, pattern, method, path string, handler any) {
 +	if pattern == "" {
 +		return
 +	}
 +	conftamerLog("Request routed", map[string]string{
 +		"pattern":      pattern,
-+		"req.Method":   r.Method,
-+		"req.URL.Path": r.URL.Path,
-+	}, r.Context(), nil, handler != nil, handler, conftamerServerConn(r.Context()))
++		"req.Method":   method,
++		"req.URL.Path": path,
++	}, ctx, nil, handler != nil, handler, conftamerServerConn(ctx))
 +}
 +
 +// ConftamerLogRouted records a route pattern matched by a router outside this
@@ -816,7 +833,7 @@ new file mode 100644
 +// handler should be the application's handler for the route, not a wrapper the
 +// router adds around it (middleware, instrumentation), so the API ID names the app.
 +func ConftamerLogRouted(pattern string, r *Request, handler any) {
-+	conftamerLogRouted(pattern, r, handler)
++	conftamerLogRouted(r.Context(), pattern, r.Method, r.URL.Path, handler)
 +}
 +
 +// Response received; as close as possible to socket.
@@ -845,9 +862,12 @@ new file mode 100644
 +
 +// --- hooks for HTTP implementations outside net/http ---------------------
 +//
-+// golang.org/x/net/http2's server and grpc-go's client (patched by
-+// contexttrack/x-net-http2-server.sh and grpc-client.patch) can't reach the
-+// unexported logger, so they log through these.
++// golang.org/x/net/http2's server and grpc-go (patched by
++// contexttrack/x-net-http2-server.sh, grpc-client.patch and grpc-server.patch)
++// can't reach the unexported logger, so they log through these. Servers that
++// build an *http.Request use the hooks that take one; those that don't (grpc-go's
++// own HTTP/2 server) use the ConftamerServer*/ConftamerLogServer* ones, which take
++// the same information as plain values: both log the same events.
 +
 +// ConftamerStampContext returns ctx with a context ID (see conftamerStampID).
 +func ConftamerStampContext(ctx context.Context) context.Context {
@@ -861,11 +881,28 @@ new file mode 100644
 +	if !conftamerOn() {
 +		return r
 +	}
-+	ctx := conftamerStampServer(r.Context(), r.URL.Path)
++	var local, remote net.Addr
 +	if c != nil {
-+		ctx = conftamerWithConn(ctx, conftamerNewConnInfo(c, -1, h2Stream).withUserAgent(r))
++		local, remote = c.LocalAddr(), c.RemoteAddr()
 +	}
-+	return r.WithContext(ctx)
++	return r.WithContext(ConftamerServerContext(r.Context(), r.URL.Path, local, remote, h2Stream, r.Header.Get))
++}
++
++// ConftamerServerContext is ConftamerServerRequest for a server without an
++// *http.Request: ctx, the context of a request it received with path (its
++// handlers' context), gets a context ID, the path, and the connection (local,
++// remote; nil: unknown) and HTTP/2 stream it arrived on; header looks up the
++// request's headers by name (nil: none).
++func ConftamerServerContext(ctx context.Context, path string, local, remote net.Addr, h2Stream uint32, header func(string) string) context.Context {
++	if !conftamerOn() {
++		return ctx
++	}
++	ctx = conftamerStampServer(ctx, path)
++	if local != nil && remote != nil {
++		info := &conftamerConnInfo{Local: local.String(), Remote: remote.String(), H2Stream: h2Stream}
++		ctx = conftamerWithConn(ctx, info.withHeaders(header))
++	}
++	return ctx
 +}
 +
 +// ConftamerLogRequestReceived logs "Request received" for a server outside
@@ -876,11 +913,30 @@ new file mode 100644
 +	case serverHandler, initALPNRequest:
 +		return
 +	}
-+	conftamerLogAt(2, time.Now(), "Request received", map[string]string{
-+		"req.Method":       r.Method,
-+		"req.URL.Path":     r.URL.Path,
-+		"req.URL.RawQuery": r.URL.RawQuery,
-+	}, r.Context(), nil, true, handler, conftamerServerConn(r.Context()))
++	conftamerLogServerReceived(r.Context(), r.Method, r.URL.Path, r.URL.RawQuery, handler)
++}
++
++// ConftamerLogServerReceived is ConftamerLogRequestReceived for a server without
++// an *http.Request: ctx from ConftamerServerContext; handler (may be nil) what
++// will handle it, for its API ID (nil: found from the stack).
++func ConftamerLogServerReceived(ctx context.Context, method, path, rawQuery string, handler any) {
++	conftamerLogServerReceived(ctx, method, path, rawQuery, handler)
++}
++
++// conftamerLogServerReceived logs "Request received" for its callers above
++// (skip 3: the event's file and line, and its call chain, are the hook's caller's).
++func conftamerLogServerReceived(ctx context.Context, method, path, rawQuery string, handler any) {
++	conftamerLogAt(3, time.Now(), "Request received", map[string]string{
++		"req.Method":       method,
++		"req.URL.Path":     path,
++		"req.URL.RawQuery": rawQuery,
++	}, ctx, nil, true, handler, conftamerServerConn(ctx))
++}
++
++// ConftamerLogServerRouted is ConftamerLogRouted for a server without an
++// *http.Request (ctx from ConftamerServerContext).
++func ConftamerLogServerRouted(ctx context.Context, pattern, method, path string, handler any) {
++	conftamerLogRouted(ctx, pattern, method, path, handler)
 +}
 +
 +// ConftamerLogResponseSent logs "Response sent" for a server outside net/http.
@@ -888,12 +944,27 @@ new file mode 100644
 +	if r == nil {
 +		return
 +	}
-+	// No caller identification: see conftamerLog.
-+	conftamerLogAt(2, time.Now(), "Response sent", map[string]string{
++	conftamerLogServerResponse(r.Context(), r.Method, conftamerRecvPath(r), code)
++}
++
++// ConftamerLogServerResponse is ConftamerLogResponseSent for a server without an
++// *http.Request (ctx from ConftamerServerContext, whose path it logs; path if it
++// has none).
++func ConftamerLogServerResponse(ctx context.Context, method, path string, code int) {
++	if p, ok := ctx.Value(conftamerRecvPathKey).(string); ok {
++		path = p
++	}
++	conftamerLogServerResponse(ctx, method, path, code)
++}
++
++// conftamerLogServerResponse logs "Response sent" for its callers above (skip 3,
++// as conftamerLogServerReceived). No caller identification: see conftamerLog.
++func conftamerLogServerResponse(ctx context.Context, method, path string, code int) {
++	conftamerLogAt(3, time.Now(), "Response sent", map[string]string{
 +		"code":         strconv.Itoa(code),
-+		"req.Method":   r.Method,
-+		"req.URL.Path": conftamerRecvPath(r),
-+	}, r.Context(), nil, false, nil, conftamerServerConn(r.Context()))
++		"req.Method":   method,
++		"req.URL.Path": path,
++	}, ctx, nil, false, nil, conftamerServerConn(ctx))
 +}
 +
 +// ConftamerLogClientRequest logs "Request sent" for a client outside net/http
@@ -1041,10 +1112,10 @@ diff --git a/usr/local/go/src/net/http/server.go b/home/tcr6/go-conftamer/src/ne
 -		h, _ = mux.mux121.findHandler(r)
 +		var pat121 string
 +		h, pat121 = mux.mux121.findHandler(r)
-+		conftamerLogRouted(pat121, r, h)
++		conftamerLogRouted(r.Context(), pat121, r.Method, r.URL.Path, h)
  	} else {
  		h, r.Pattern, r.pat, r.matches = mux.findHandler(r)
-+		conftamerLogRouted(r.Pattern, r, h)
++		conftamerLogRouted(r.Context(), r.Pattern, r.Method, r.URL.Path, h)
  	}
  	h.ServeHTTP(w, r)
  }

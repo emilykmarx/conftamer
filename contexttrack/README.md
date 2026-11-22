@@ -148,17 +148,30 @@ In place, in the Grafana checkout:
 cd ~/prombench-src/grafana && patch -p1 < ~/conftamer/contexttrack/grafana-web-route.patch
 ```
 
-[`grpc-route.patch`](grpc-route.patch): grpc-go's method dispatch; need to apply for etcd:
+[`grpc-route.patch`](grpc-route.patch): grpc-go's server side (its header says how): the method dispatch as
+"Request routed" for a `grpc.Server` served through `net/http` (`Server.ServeHTTP`), and every server event for one
+on grpc-go's own HTTP/2 server (`Server.Serve`), which `net/http` never sees. etcd uses both, depending on its
+listeners. To apply it to a module that doesn't vendor grpc (etcd):
 
 ```bash
 go mod download google.golang.org/grpc@<version>
 cp -r ~/go/pkg/mod/google.golang.org/grpc@<version> ~/grpc-conftamer
 chmod -R u+w ~/grpc-conftamer
 cd ~/grpc-conftamer && patch -p1 < ~/conftamer/contexttrack/grpc-route.patch
-cd /path/to/etcd/server && go mod edit -replace=google.golang.org/grpc=$HOME/grpc-conftamer # REPLACE WITH ETCD
+cd /path/to/etcd/server && go mod edit -replace=google.golang.org/grpc=$HOME/grpc-conftamer
 ```
 
-In Kubernetes, which vendors grpc (v1.82.1), apply it in place in `~/kubernetes/vendor/google.golang.org/grpc`.
+In Kubernetes, which vendors grpc (v1.65.0), apply it in place in `~/kubernetes/vendor/google.golang.org/grpc`.
+
+#### Hooks for servers and clients outside `net/http`
+
+The patched `net/http` exports hooks for the other libraries' patches, in `conftamer.go`'s "hooks for HTTP
+implementations outside net/http": for a server that builds an `*http.Request` (x/net's HTTP/2 server),
+`ConftamerServerRequest`, `ConftamerLogRequestReceived`, `ConftamerLogResponseSent` (and `ConftamerLogRouted`, for
+routers); for one that doesn't (grpc-go's own server), the same events from plain values: `ConftamerServerContext`,
+`ConftamerLogServerReceived`, `ConftamerLogServerRouted`, `ConftamerLogServerResponse`; for clients,
+`ConftamerLogClientRequest` and `ConftamerLogClientResponse`. Library-specific patches only call them, so changes to
+what's logged go in `go-inlibrary.patch`.
 
 #### gRPC client
 
@@ -227,8 +240,10 @@ The server side's events (`Request received`, `Request routed` and `Response sen
 `{"local":"10.96.0.20:80","remote":"10.244.1.2:47832","index":1}`, so `remote` is the
 client's address. `index` is the request's position on an HTTP/1 connection (from 0); HTTP/2
 server events have `h2_stream` instead. They also carry `user_agent`, the request's User-Agent
-header (what the client says it is, e.g. a testbed workload tagging its requests); it's not in
-`message`, so it isn't part of the message's label.
+header (what the client says it is, e.g. a testbed workload tagging its requests), and
+`kubectl_command`, its Kubectl-Command header (the kubectl command that sent it, e.g. `kubectl
+patch`, which kubectl's User-Agent doesn't say); neither is in `message`, so neither is part of
+the message's label.
 
 `Response sent` is logged when the handler's response header is written (`WriteHeader`). A
 handler that hijacks the connection without writing one, such as a WebSocket upgrader that

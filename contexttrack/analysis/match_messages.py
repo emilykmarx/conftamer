@@ -216,7 +216,7 @@ class Side:
         # type, and the types some message of which came from the receiver's own
         # IP (remote IP == local IP: the component sent it to itself)
         self.client_ips: dict[tuple, set] = defaultdict(set)
-        # The clients as (IP, User-Agent) pairs (the server side's user_agent)
+        # The clients as (IP, User-Agent, kubectl command) (the server side's user_agent and kubectl_command)
         self.client_agents: dict[tuple, set] = defaultdict(set)
         self.self_sent: set[tuple] = set()
 
@@ -234,7 +234,8 @@ class Side:
             self.first[typ] = min(ts, self.first.get(typ, ts))
             self.last[typ] = max(ts, self.last.get(typ, ts))
 
-    def add_server_conn(self, typ: tuple, conn: dict | None, user_agent: str | None = None) -> None:
+    def add_server_conn(self, typ: tuple, conn: dict | None, user_agent: str | None = None,
+                        kubectl_command: str | None = None) -> None:
         """Records a received request's connection (its event's conn): the
         client's IP, and whether it is the receiver's own. A loopback IP isn't:
         a port-forward's and a command's in the container (kubectl exec) come
@@ -244,7 +245,7 @@ class Side:
             return
         remote = _ip(conn["remote"])
         self.client_ips[typ].add(remote)
-        self.client_agents[typ].add((remote, user_agent or ""))
+        self.client_agents[typ].add((remote, user_agent or "", kubectl_command or ""))
         if conn.get("local") and _ip(conn["local"]) == remote and not is_loopback(remote):
             self.self_sent.add(typ)
 
@@ -281,7 +282,7 @@ def collect(path: Path, sides: dict[str, Side], on_message=None) -> None:
             recvd[group].append(ev)
             typ = _recvd_req_type(ev)
             sides["rcv_req"].add(typ, comp, msg.get("req.URL.Path"), ev.get("ts"))
-            sides["rcv_req"].add_server_conn(typ, ev.get("conn"), ev.get("user_agent"))
+            sides["rcv_req"].add_server_conn(typ, ev.get("conn"), ev.get("user_agent"), ev.get("kubectl_command"))
         elif kind == "Response sent":
             # Match on method and path, else the only request in the context:
             # handlers may rewrite the path before responding (e.g. Prometheus serveDebug)
@@ -291,7 +292,7 @@ def collect(path: Path, sides: dict[str, Side], on_message=None) -> None:
             req = _recvd_req_type(reqs[-1]) if reqs else _NO_REQ
             typ = (req[0], msg.get("code", ""), req)
             sides["snd_resp"].add(typ, comp, ts=ev.get("ts"))
-            sides["snd_resp"].add_server_conn(typ, ev.get("conn"), ev.get("user_agent"))
+            sides["snd_resp"].add_server_conn(typ, ev.get("conn"), ev.get("user_agent"), ev.get("kubectl_command"))
         elif kind == "Response received":
             reqs = [r for r in sent[group] if _req_identity(r) == _req_identity(ev)]
             req = _sent_req_type(reqs[-1]) if reqs else _NO_REQ
@@ -467,7 +468,8 @@ def build_rows(sides: dict[str, Side], loopback_within: bool = False) -> list[di
                 ips = (sides["snd_resp"].client_ips[s] if is_resp and s else set()) \
                     or sides["rcv_req"].client_ips[server_req]
                 row["client_ips"] = ";".join(sorted(ips))
-                # The same clients with their User-Agents: JSON [[ip, user_agent], ...]
+                # The same clients with their User-Agents and kubectl commands: JSON [[ip, user_agent,
+                # kubectl_command], ...]
                 agents = (sides["snd_resp"].client_agents[s] if is_resp and s else set()) \
                     or sides["rcv_req"].client_agents[server_req]
                 row["client_agents"] = json.dumps(sorted(agents)) if agents else ""
