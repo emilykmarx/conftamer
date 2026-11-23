@@ -51,6 +51,20 @@ class HelloAcrossRuns(unittest.TestCase):
                          ["matched-pattern"])
 
 
+    def test_separate_runs_pair_k8s(self):
+        # The same, on a real route: Prometheus in prombench lists pods in a namespace its concrete config names
+        # (Kubernetes service discovery); kube-apiserver in its own integration tests
+        # (test/integration/replicationcontroller/replicationcontroller_test.go: a namespace
+        # "test-spec-replicas-change", then c.CoreV1().Pods(ns.Name).List) logs that route's path under its go-restful
+        # pattern
+        snd, rcv = Side("snd_req"), Side("rcv_req")
+        snd.add(("k8s.io", "GET", "kubernetes.default.svc:443",
+                 "/api/v1/namespaces/ccfg-alerting-alertmanagers-kubernetes-sd-configs-namespaces-names/pods"),
+                "prometheus")
+        rcv.add(("k8s.io", "GET", "", "/api/v1/namespaces/{namespace}/pods"), "kube-apiserver",
+                path="/api/v1/namespaces/test-spec-replicas-change/pods")
+        self.assertEqual(statuses(match_requests(snd, rcv)), ["matched-pattern"])
+
 
 class RoutedLikeARouter(unittest.TestCase):
     """Without the logged paths to go by, a path pairs with the patterns a router would route it to"""
