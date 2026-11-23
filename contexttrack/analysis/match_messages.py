@@ -322,7 +322,8 @@ def is_loopback(host: str) -> bool:
     return h == "localhost" or h == "::1" or h.startswith("127.")
 
 
-def match_requests(snd: Side, rcv: Side, loopback_within: bool = False) -> list[tuple]:
+def match_requests(snd: Side, rcv: Side, loopback_within: bool = False,
+                   shared_netns: tuple = ()) -> list[tuple]:
     """(status, sender type, receiver type) for every request type.
 
     loopback_within: a sender and a receiver type logged only by the same
@@ -334,9 +335,10 @@ def match_requests(snd: Side, rcv: Side, loopback_within: bool = False) -> list[
     component: loopback doesn't leave the sender's network namespace, so no
     other component received it. Except that components sharing a network
     namespace (host-network pods on the same node, e.g. kube-apiserver and
-    etcd on the control plane) do reach each other over loopback: so instead
-    of dropping such a pair, this raises (loopback_cross_component), until
-    that case is handled.
+    etcd on the control plane) do reach each other over loopback: shared_netns
+    lists such groups (sets of component names), whose loopback requests pair
+    with each other's; a loopback pair across components outside one group
+    raises (loopback_cross_component) rather than being dropped.
     Without it, a proxy's forwarded request pairs with the request it received
     (both carry the proxy's api_id and route). Off by default: a component
     named after a container can be several pods (component), which do send to
@@ -360,7 +362,8 @@ def match_requests(snd: Side, rcv: Side, loopback_within: bool = False) -> list[
         hits += [("matched-pattern", r) for r in cands if r[3] != s[3] and (
             s[3] in rcv.paths[r] if rcv.paths[r] else pattern_matches(r[3], s[3]))]
         if loopback_within and is_loopback(s[2]):
-            other = [r for _, r in hits if rcv.components[r] != snd.components[s]]
+            other = [r for _, r in hits if rcv.components[r] != snd.components[s]
+                     and not any(snd.components[s] | rcv.components[r] <= g for g in shared_netns)]
             if other:
                 loopback_cross_component(s, snd, other, rcv)
         for status, r in hits:
@@ -440,9 +443,9 @@ def _other_api_ids(typ: tuple, others: Side, is_resp: bool) -> str:
     return ";".join(sorted(i or "(none)" for i in ids))
 
 
-def build_rows(sides: dict[str, Side], loopback_within: bool = False) -> list[dict]:
-    """loopback_within: see match_requests"""
-    req_rows = match_requests(sides["snd_req"], sides["rcv_req"], loopback_within)
+def build_rows(sides: dict[str, Side], loopback_within: bool = False, shared_netns: tuple = ()) -> list[dict]:
+    """loopback_within, shared_netns: see match_requests"""
+    req_rows = match_requests(sides["snd_req"], sides["rcv_req"], loopback_within, shared_netns)
     req_pairs = {(s, r) for status, s, r in req_rows if status.startswith("matched")}
     resp_rows = match_responses(sides["snd_resp"], sides["rcv_resp"], req_pairs)
 
