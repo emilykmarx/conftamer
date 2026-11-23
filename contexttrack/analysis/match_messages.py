@@ -367,8 +367,7 @@ def is_loopback(host: str) -> bool:
     return h == "localhost" or h == "::1" or h.startswith("127.")
 
 
-def match_requests(snd: Side, rcv: Side, loopback_within: bool = False,
-                   shared_netns: tuple = ()) -> list[tuple]:
+def match_requests(snd: Side, rcv: Side, loopback_within: bool = False) -> list[tuple]:
     """(status, sender type, receiver type) for every request type.
 
     loopback_within: a sender and a receiver type logged only by the same
@@ -376,15 +375,11 @@ def match_requests(snd: Side, rcv: Side, loopback_within: bool = False,
     the receiver logged the type from its own IP (Side.self_sent: needs the
     server side's conn): for components that each are one process, which
     sends to itself only those ways (e.g. Prometheus scraping itself at its
-    pod IP). And a request to a loopback host pairs only with its own
-    component: loopback doesn't leave the sender's network namespace, so no
-    other component received it. Except that components sharing a network
-    namespace (host-network pods on the same node, e.g. kube-apiserver and
-    etcd on the control plane) do reach each other over loopback: shared_netns
-    lists such groups (sets of component names), whose loopback requests pair
-    with each other's; a loopback pair across components outside one group
-    raises (loopback_cross_component) rather than being dropped.
-    Without it, a proxy's forwarded request pairs with the request it received
+    pod IP). It's a rule about one component's own messages only: a request
+    to a loopback host pairs with other components' types as any request
+    does, by type, since which components share a network namespace depends
+    on the testbed (the sender's and the receiver's events can come from
+    separate runs). Without it, a proxy's forwarded request pairs with the request it received
     (both carry the proxy's api_id and route). Off by default: a component
     named after a container can be several pods (component), which do send to
     each other."""
@@ -412,11 +407,6 @@ def match_requests(snd: Side, rcv: Side, loopback_within: bool = False,
         hits = [("matched-exact", r) for r in cands if r[3] == s[3]]
         hits += [("matched-pattern", r) for r in most_specific(
             [r for _, r in hits], [r for r in cands if r[3] != s[3] and pattern_matches(r[3], s[3])], rcv)]
-        if loopback_within and is_loopback(s[2]):
-            other = [r for _, r in hits if rcv.components[r] != snd.components[s]
-                     and not any(snd.components[s] | rcv.components[r] <= g for g in shared_netns)]
-            if other:
-                loopback_cross_component(s, snd, other, rcv)
         for status, r in hits:
             rows.append((status, s, r))
             matched.add(r)
@@ -424,23 +414,6 @@ def match_requests(snd: Side, rcv: Side, loopback_within: bool = False,
             rows.append(("unmatched-sender", s, None))
     rows += [("unmatched-receiver", None, r) for r in rcv.n if r not in matched]
     return rows
-
-
-def loopback_cross_component(s: tuple, snd: Side, others: list, rcv: Side) -> None:
-    """A request to a loopback host (s) would pair with receiver types another
-    component logged: match_requests' loopback_within rule. Raises rather than
-    deciding, since both cases happen:
-    - the components share a network namespace (host-network pods on one
-      node, e.g. etcd added as a module next to kube-apiserver): a real pair,
-      which loopback_within should then allow (e.g. from the pods' hostNetwork
-      and node, in the testbed's address snapshot);
-    - they don't: a false pair, from made-up api_ids that are too broad (e.g.
-      an --api-ids line covering a component's requests to itself)."""
-    raise RuntimeError(
-        f"request to loopback host {s[2]!r} ({s[1]} {s[3]}, api_id {s[0]!r}), sent by "
-        f"{sorted(snd.components[s])}, would pair with types received by "
-        f"{sorted(set().union(*(rcv.components[r] for r in others)))}: loopback reaches another component only if "
-        "they share a network namespace (host network on one node); see match_requests' loopback_within")
 
 
 def match_responses(snd: Side, rcv: Side, req_pairs: set[tuple]) -> list[tuple]:
@@ -494,9 +467,9 @@ def _other_api_ids(typ: tuple, others: Side, is_resp: bool) -> str:
     return ";".join(sorted(i or "(none)" for i in ids))
 
 
-def build_rows(sides: dict[str, Side], loopback_within: bool = False, shared_netns: tuple = ()) -> list[dict]:
-    """loopback_within, shared_netns: see match_requests"""
-    req_rows = match_requests(sides["snd_req"], sides["rcv_req"], loopback_within, shared_netns)
+def build_rows(sides: dict[str, Side], loopback_within: bool = False) -> list[dict]:
+    """loopback_within: see match_requests"""
+    req_rows = match_requests(sides["snd_req"], sides["rcv_req"], loopback_within)
     req_pairs = {(s, r) for status, s, r in req_rows if status.startswith("matched")}
     resp_rows = match_responses(sides["snd_resp"], sides["rcv_resp"], req_pairs)
 

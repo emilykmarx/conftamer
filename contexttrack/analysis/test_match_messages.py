@@ -79,5 +79,26 @@ class RoutedLikeARouter(unittest.TestCase):
         self.assertEqual(statuses(match_requests(*sides("/version", "/version/", ["/version"]))), ["matched-pattern"])
 
 
+
+class Loopback(unittest.TestCase):
+    """match_requests' loopback_within: a rule about one component's own messages only"""
+
+    def test_loopback_pairs_across_components(self):
+        # kube-apiserver reaches etcd over loopback (host network on one node), but whether two components share a
+        # network namespace depends on the testbed: a loopback request pairs by type
+        snd, rcv = Side("snd_req"), Side("rcv_req")
+        snd.add(("go.etcd.io", "POST", "127.0.0.1:2379", "/etcdserverpb.KV/Range"), "kube-apiserver")
+        rcv.add(("go.etcd.io", "POST", "", "/etcdserverpb.KV/Range"), "etcd", path="/etcdserverpb.KV/Range")
+        self.assertEqual(statuses(match_requests(snd, rcv, loopback_within=True)), ["matched-exact"])
+
+    def test_proxy_not_paired_with_itself(self):
+        # a proxy's forwarded request has the api_id and route of the request it received: it doesn't pair with it
+        snd, rcv = Side("snd_req"), Side("rcv_req")
+        snd.add(("github.com/caddyserver", "GET", "grafana.default.svc:3000", "/grafana/api/search"), "caddy")
+        rcv.add(("github.com/caddyserver", "GET", "", 'path=["/grafana/*"]'), "caddy", path="/grafana/api/search")
+        self.assertEqual(statuses(match_requests(snd, rcv, loopback_within=True)),
+                         ["unmatched-receiver", "unmatched-sender"])
+
+
 if __name__ == "__main__":
     unittest.main()
