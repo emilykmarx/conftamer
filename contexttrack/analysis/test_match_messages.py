@@ -29,8 +29,7 @@ class HelloAcrossRuns(unittest.TestCase):
     server's events come from the same run, the server logs the client's path, and they pair. When they come from
     separate runs (e.g. the client's from a testbed, the server's from its own integration tests), each run has its
     own ID: the client sent /hello/123, the server received /hello/456 under its pattern. They are the same message
-    type, but match_requests only pairs a path with a pattern when the server logged that very path under it (so
-    that a catch-all pattern, e.g. ServeMux "/", doesn't pair with everything), so they don't pair."""
+    type, and pair: the pattern decides, not the paths the server logged under it (match_requests)."""
 
     def test_same_run_pairs(self):
         # (the control: the server logged the client's path)
@@ -41,16 +40,43 @@ class HelloAcrossRuns(unittest.TestCase):
         # (with no path logged under the pattern, match_requests falls back to the pattern itself)
         self.assertEqual(statuses(match_requests(*sides("/hello/123", "/hello/{id}", []))), ["matched-pattern"])
 
-    # (fails: separate runs' IDs differ, and the logged paths, not the pattern, decide)
     def test_separate_runs_pair(self):
         self.assertTrue(pattern_matches("/hello/{id}", "/hello/123"))
         self.assertEqual(statuses(match_requests(*sides("/hello/123", "/hello/{id}", ["/hello/456"]))),
                          ["matched-pattern"])
 
-    # (fails: as above, and pattern_matches doesn't handle a bare `*` segment either: only *name, {x...}, ...)
+    # (a bare `*` at the end: pattern_matches)
     def test_separate_runs_pair_star_pattern(self):
         self.assertEqual(statuses(match_requests(*sides("/hello/123", "/hello/*", ["/hello/456"]))),
                          ["matched-pattern"])
+
+
+
+class RoutedLikeARouter(unittest.TestCase):
+    """Without the logged paths to go by, a path pairs with the patterns a router would route it to"""
+
+    def test_subtree_yields_to_exact(self):
+        # kube-apiserver logs its discovery request GET /api under the prefix "/api/", and GET /api/v1/pods under its
+        # path: GET /api/v1/pods pairs with the latter only
+        snd, rcv = Side("snd_req"), Side("rcv_req")
+        snd.add(("k8s.io", "GET", "10.96.0.1:443", "/api/v1/pods"), "client")
+        rcv.add(("k8s.io", "GET", "", "/api/"), "server", path="/api")
+        rcv.add(("k8s.io", "GET", "", "/api/v1/pods"), "server", path="/api/v1/pods")
+        rows = match_requests(snd, rcv)
+        self.assertEqual([(st, r[3]) for st, _, r in rows if st.startswith("matched")],
+                         [("matched-exact", "/api/v1/pods")])
+
+    def test_most_specific_pattern(self):
+        snd, rcv = Side("snd_req"), Side("rcv_req")
+        snd.add((API_ID, "GET", "hello-server:8080", "/hello/123"), "client")
+        rcv.add((API_ID, "GET", "", "/hello/"), "server", path="/hello/other")
+        rcv.add((API_ID, "GET", "", "/hello/{id}"), "server", path="/hello/456")
+        rows = match_requests(snd, rcv)
+        self.assertEqual([r[3] for st, _, r in rows if st.startswith("matched")], ["/hello/{id}"])
+
+    def test_trailing_slash_optional(self):
+        # (kube-apiserver logs GET /version under "/version/")
+        self.assertEqual(statuses(match_requests(*sides("/version", "/version/", ["/version"]))), ["matched-pattern"])
 
 
 if __name__ == "__main__":

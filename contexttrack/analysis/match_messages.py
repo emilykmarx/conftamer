@@ -8,8 +8,10 @@ Each message is reduced to a deduplicated type:
   Response received: (api_id, code, type of the sent request it answers)
 
 Request types pair when api_id and method are equal and the paths are equal
-("matched-exact") or the receiver's route pattern is one it received the
-sender's path under ("matched-pattern").
+("matched-exact") or the receiver's route pattern matches the sender's path
+("matched-pattern"; pattern_matches). Nothing assumes the sender and the
+receiver logged in the same run: not the concrete paths a receiver logged
+under a pattern, nor times or hosts.
 Host is used for reference/debugging, not matching.
 Response types pair when api_id and code are equal and the requests they
 answer were paired.
@@ -144,10 +146,51 @@ def caddy_pattern_matches(pattern: str, path: str) -> bool | None:
     return False
 
 
+def specificity(pattern: str) -> int:
+    """How specific a route pattern is: its literal characters
+    (without wildcards: {x}, :x, *x, *), as routers prefer the longest literal
+    match"""
+    pat = strip_pattern(pattern)
+    pat = re.sub(r"\{[^{}]*\}|:[A-Za-z_]\w*|\*[A-Za-z_]\w*|\*", "", pat)
+    return len(pat)
+
+
+def is_subtree(pattern: str) -> bool:
+    """Whether a route pattern matches everything below a prefix (a trailing
+    `/`, `{x...}`, `{x:*}`, `*name` or `*`): a router's fallback, used only
+    when no more specific route matches (most_specific)"""
+    if caddy_pattern_matches(pattern, "") is not None:
+        return False
+    pat = strip_pattern(pattern)
+    return (pat.endswith("/") and not pattern.endswith("{$}")) or bool(
+        re.search(r"(\{[^{}]*(\.\.\.|:\s*\*\s*)\}|\*[A-Za-z_]?\w*)$", pat))
+
+
+def most_specific(exact: list, patterns: list, rcv: "Side") -> list:
+    """Of the receiver types whose patterns match a path (`patterns`), the ones
+    a router would route it to, per receiving component(s): a subtree pattern
+    (is_subtree) only if nothing else matched (neither an exact type, `exact`,
+    nor another pattern); then the most specific (specificity). A receiver can log one request under its path and under its
+    pattern (e.g. kube-apiserver's leases): those patterns stay"""
+    by_comp: dict = defaultdict(list)
+    for r in patterns:
+        by_comp[frozenset(rcv.components[r])].append(r)
+    out = []
+    for comp, rs in by_comp.items():
+        if any(frozenset(rcv.components[r]) == comp for r in exact) or not all(is_subtree(r[3]) for r in rs):
+            rs = [r for r in rs if not is_subtree(r[3])]
+        if rs:
+            top = max(specificity(r[3]) for r in rs)
+            out += [r for r in rs if specificity(r[3]) == top]
+    return out
+
+
 def pattern_matches(pattern: str, path: str) -> bool:
     """Whether route `pattern` matches concrete `path`. Handles ServeMux
-    {x}, {x...}, {$} and trailing-"/" subtrees, go-restful {x:*} and {x:regex},
-    httprouter :x and *x, and Caddy's matcher patterns."""
+    {x}, {x...}, {$} and trailing-"/" subtrees (a trailing "/" also matches
+    the path without it, e.g. kube-apiserver's /version/ gets /version),
+    go-restful {x:*} and {x:regex}, httprouter :x and *x, a bare * at the end
+    (e.g. chi's /hello/*), and Caddy's matcher patterns."""
     caddy = caddy_pattern_matches(pattern, path)
     if caddy is not None:
         return caddy
@@ -166,8 +209,9 @@ def pattern_matches(pattern: str, path: str) -> bool:
     rx = re.sub(r"\\\{[^}]*\\\}", "[^/]+", rx)             # {x}
     rx = re.sub(r":[A-Za-z_]\w*", "[^/]+", rx)             # :x
     rx = re.sub(r"\\\*[A-Za-z_]\w*$", ".*", rx)            # *x
+    rx = re.sub(r"\\\*$", ".*", rx)                         # * at the end
     if pat.endswith("/") and not pattern.endswith("{$}"):
-        rx += ".*"
+        rx = rx[:-1] + "(?:/.*)?"
     return re.fullmatch(rx, path) is not None
 
 
@@ -263,12 +307,18 @@ def match_requests(snd: Side, rcv: Side) -> list[tuple]:
     for s in snd.n:
         cands = by_key[s[:2]]
         # A receiver can log the same request under its path and, when routed,
-        # under its pattern (e.g. kube-apiserver's leases), so take both. A
-        # pattern counts only if the receiver logged this path under it: a
-        # catch-all (ServeMux "/", "/api/") matches every path, but receives few.
+        # under its pattern (e.g. kube-apiserver's leases), so take both. The
+        # pattern decides, not the paths the receiver happened to log under it:
+        # the client's and the server's events can come from separate runs
+        # (e.g. a testbed and the server's own tests), whose IDs in paths
+        # differ. A catch-all pattern (ServeMux "/") matches every path; the
+        # api_id, equal on both sides, is what keeps it to its own library's.
+        # Of the patterns a receiver matches the path with, only those a router
+        # would route it to (most_specific): e.g. not kube-apiserver's "/api/"
+        # prefix (its discovery requests, GET /api) for GET /api/v1/pods.
         hits = [("matched-exact", r) for r in cands if r[3] == s[3]]
-        hits += [("matched-pattern", r) for r in cands if r[3] != s[3] and (
-            s[3] in rcv.paths[r] if rcv.paths[r] else pattern_matches(r[3], s[3]))]
+        hits += [("matched-pattern", r) for r in most_specific(
+            [r for _, r in hits], [r for r in cands if r[3] != s[3] and pattern_matches(r[3], s[3])], rcv)]
         for status, r in hits:
             rows.append((status, s, r))
             matched.add(r)
