@@ -8,8 +8,14 @@ Each message is reduced to a deduplicated type:
   Response received: (api_id, code, type of the sent request it answers)
 
 Request types pair when api_id and method are equal and the paths are equal
-("matched-exact") or the receiver's route pattern is one it received the
-sender's path under ("matched-pattern").
+("matched-exact") or the receiver's route pattern matches the sender's path
+("matched-pattern"; pattern_matches), the pattern a router would route the
+path to (most_specific). A received type logged under a concrete path (never
+routed, e.g. rejected first) counts as its receiver's pattern for that path
+(fold_unrouted); an exact pair with one that stays unrouted is
+"matched-exact-unrouted" (match_requests; its responses too: build_rows). Nothing assumes the sender and the
+receiver logged in the same run: not the concrete paths a receiver logged
+under a pattern, nor times or hosts.
 Host is used for reference/debugging, not matching.
 Response types pair when api_id and code are equal and the requests they
 answer were paired.
@@ -144,10 +150,53 @@ def caddy_pattern_matches(pattern: str, path: str) -> bool | None:
     return False
 
 
+def specificity(pattern: str) -> int:
+    """How specific a route pattern is: its literal characters
+    (without wildcards: {x}, :x, *x, *), as routers prefer the longest literal
+    match"""
+    pat = strip_pattern(pattern)
+    pat = re.sub(r"\{[^{}]*\}|:[A-Za-z_]\w*|\*[A-Za-z_]\w*|\*", "", pat)
+    return len(pat)
+
+
+def is_subtree(pattern: str) -> bool:
+    """Whether a route pattern matches everything below a prefix (a trailing
+    `/`, `{x...}`, `{x:*}`, `*name` or `*`): a router's fallback, used only
+    when no more specific route matches (most_specific)"""
+    if caddy_pattern_matches(pattern, "") is not None:
+        return False
+    pat = strip_pattern(pattern)
+    return (pat.endswith("/") and not pattern.endswith("{$}")) or bool(
+        re.search(r"(\{[^{}]*(\.\.\.|:\s*\*\s*)\}|\*[A-Za-z_]?\w*)$", pat))
+
+
+def most_specific(patterns: list, rcv: "Side") -> list:
+    """Of the receiver types whose patterns match a path (`patterns`, literal
+    routes included: a pattern equal to the path), the ones a router would
+    route it to, per receiving component(s): a subtree pattern (is_subtree)
+    only if no other pattern matched; then the most specific (specificity: a
+    literal route is at least as specific as any pattern matching its path).
+    So a sender type pairs with one receiver type per receiving component,
+    unless equally specific patterns tie"""
+    by_comp: dict = defaultdict(list)
+    for r in patterns:
+        by_comp[frozenset(rcv.components[r])].append(r)
+    out = []
+    for comp, rs in by_comp.items():
+        if not all(is_subtree(r[3]) for r in rs):
+            rs = [r for r in rs if not is_subtree(r[3])]
+        if rs:
+            top = max(specificity(r[3]) for r in rs)
+            out += [r for r in rs if specificity(r[3]) == top]
+    return out
+
+
 def pattern_matches(pattern: str, path: str) -> bool:
     """Whether route `pattern` matches concrete `path`. Handles ServeMux
-    {x}, {x...}, {$} and trailing-"/" subtrees, go-restful {x:*} and {x:regex},
-    httprouter :x and *x, and Caddy's matcher patterns."""
+    {x}, {x...}, {$} and trailing-"/" subtrees (a trailing "/" also matches
+    the path without it, e.g. kube-apiserver's /version/ gets /version),
+    go-restful {x:*} and {x:regex}, httprouter :x and *x, a bare * at the end
+    (e.g. chi's /hello/*), and Caddy's matcher patterns."""
     caddy = caddy_pattern_matches(pattern, path)
     if caddy is not None:
         return caddy
@@ -166,8 +215,9 @@ def pattern_matches(pattern: str, path: str) -> bool:
     rx = re.sub(r"\\\{[^}]*\\\}", "[^/]+", rx)             # {x}
     rx = re.sub(r":[A-Za-z_]\w*", "[^/]+", rx)             # :x
     rx = re.sub(r"\\\*[A-Za-z_]\w*$", ".*", rx)            # *x
+    rx = re.sub(r"\\\*$", ".*", rx)                         # * at the end
     if pat.endswith("/") and not pattern.endswith("{$}"):
-        rx += ".*"
+        rx = rx[:-1] + "(?:/.*)?"
     return re.fullmatch(rx, path) is not None
 
 
@@ -195,6 +245,23 @@ class Side:
         self.paths: dict[tuple, set] = defaultdict(set)  # concrete paths per type
         self.first: dict[tuple, int] = {}  # earliest and latest event timestamp (ns) per type
         self.last: dict[tuple, int] = {}
+        # Received requests: the types logged with a route pattern (routed), and
+        # the never-routed types fold_unrouted folded into one (type -> pattern's)
+        self.routed: set[tuple] = set()
+        self.folded: dict[tuple, tuple] = {}
+
+    def merge(self, old: tuple, new: tuple) -> None:
+        """Count type `old`'s messages as type `new`'s (fold_unrouted)"""
+        self.ids.setdefault(new, self.ids[old])
+        del self.ids[old]
+        self.messages[new] += self.messages.pop(old, [])
+        self.n[new] += self.n.pop(old)
+        self.components[new] |= self.components.pop(old, set())
+        self.paths[new] |= self.paths.pop(old, set())
+        for d, pick in ((self.first, min), (self.last, max)):
+            if old in d:
+                v = d.pop(old)
+                d[new] = pick(v, d[new]) if new in d else v
 
     def add(self, typ: tuple, comp: str, path: str | None = None, ts: int | None = None,
             node: str = "", conn: dict | None = None) -> None:
@@ -232,7 +299,10 @@ def collect(path: Path, sides: dict[str, Side]) -> None:
             sides["snd_req"].add(_sent_req_type(ev), comp, ts=ev.get("ts"), node=node, conn=ev.get("conn"))
         elif kind == "Request received":
             recvd[group].append(ev)
-            sides["rcv_req"].add(_recvd_req_type(ev), comp, msg.get("req.URL.Path"), ev.get("ts"))
+            typ = _recvd_req_type(ev)
+            sides["rcv_req"].add(typ, comp, msg.get("req.URL.Path"), ev.get("ts"))
+            if ev.get("route_pattern"):
+                sides["rcv_req"].routed.add(typ)
         elif kind == "Response sent":
             # Match on method and path, else the only request in the context:
             # handlers may rewrite the path before responding (e.g. Prometheus serveDebug)
@@ -262,13 +332,23 @@ def match_requests(snd: Side, rcv: Side) -> list[tuple]:
     rows, matched = [], set()
     for s in snd.n:
         cands = by_key[s[:2]]
-        # A receiver can log the same request under its path and, when routed,
-        # under its pattern (e.g. kube-apiserver's leases), so take both. A
-        # pattern counts only if the receiver logged this path under it: a
-        # catch-all (ServeMux "/", "/api/") matches every path, but receives few.
-        hits = [("matched-exact", r) for r in cands if r[3] == s[3]]
-        hits += [("matched-pattern", r) for r in cands if r[3] != s[3] and (
-            s[3] in rcv.paths[r] if rcv.paths[r] else pattern_matches(r[3], s[3]))]
+        # (A receiver's never-routed types of paths its patterns match were
+        # folded into them: fold_unrouted.) The pattern decides, not the paths the receiver happened to log under it:
+        # the client's and the server's events can come from separate runs
+        # (e.g. a testbed and the server's own tests), whose IDs in paths
+        # differ. A catch-all pattern (ServeMux "/") matches every path; the
+        # api_id, equal on both sides, is what keeps it to its own library's.
+        # Of the patterns a receiver matches the path with, only those a router
+        # would route it to (most_specific): e.g. not kube-apiserver's "/api/"
+        # prefix (its discovery requests, GET /api) for GET /api/v1/pods.
+        # A routed type of this very path is a literal route, one of the
+        # patterns; a never-routed one (fold_unrouted couldn't fold it) pairs
+        # exactly, flagged: it may not form with another run's events.
+        exact = [r for r in cands if r[3] == s[3]]
+        hits = [("matched-exact-unrouted", r) for r in exact if r not in rcv.routed]
+        hits += [("matched-exact" if r[3] == s[3] else "matched-pattern", r) for r in most_specific(
+            [r for r in exact if r in rcv.routed] +
+            [r for r in cands if r[3] != s[3] and pattern_matches(r[3], s[3])], rcv)]
         for status, r in hits:
             rows.append((status, s, r))
             matched.add(r)
@@ -329,10 +409,46 @@ def _other_api_ids(typ: tuple, others: Side, is_resp: bool) -> str:
     return ";".join(sorted(i or "(none)" for i in ids))
 
 
+def fold_unrouted(sides: dict[str, Side]) -> None:
+    """Fold each never-routed received request type (logged under its
+    concrete path, e.g. a request kube-apiserver rejected before routing it)
+    into the routed type a router would have routed its path to: one of the
+    same receiver's (component, api_id, method) patterns that matches the path,
+    the most specific (most_specific; if several tie, it stays as it is). Its
+    responses' types follow. This uses only the receiver's own events, so the
+    result doesn't depend on which clients ran with it: in another run, the
+    same request would have a concrete path no client's equals."""
+    rcv = sides["rcv_req"]
+    folded = {}  # (this call's: a second call finds nothing more to fold)
+    for u in [t for t in rcv.n if t not in rcv.routed]:
+        cands = [r for r in rcv.routed if r[:2] == u[:2] and rcv.components[u] <= rcv.components[r]
+                 and pattern_matches(r[3], u[3])]
+        best = most_specific(cands, rcv)
+        if len(best) == 1:
+            folded[u] = best[0]
+    for u, r in folded.items():
+        rcv.merge(u, r)
+    resp = sides["snd_resp"]
+    for t in [t for t in resp.n if t[2] in folded]:
+        resp.merge(t, (t[0], t[1], folded[t[2]]))
+    rcv.folded.update(folded)
+
+
 def build_rows(sides: dict[str, Side]) -> list[dict]:
+    """Rows of every request and response type, paired (after fold_unrouted).
+    A request pair whose receiver type was never routed (logged only under
+    concrete paths, and not folded) has status matched-exact-unrouted, and so
+    have its responses (match_requests flags the requests): such a type exists only because the receiver got that
+    very path in this run, so the pair may not form with the receiver's
+    events from another run, unless the path is a literal route (e.g.
+    /healthz)."""
+    fold_unrouted(sides)
     req_rows = match_requests(sides["snd_req"], sides["rcv_req"])
+    unrouted = {r for r in sides["rcv_req"].n if r not in sides["rcv_req"].routed}
     req_pairs = {(s, r) for status, s, r in req_rows if status.startswith("matched")}
     resp_rows = match_responses(sides["snd_resp"], sides["rcv_resp"], req_pairs)
+    resp_rows = [("matched-exact-unrouted" if status == "matched-exact" and s[2] in unrouted else status, s, r)
+                 for status, s, r in resp_rows]
 
     out = []
     for message, rows, snd, rcv in (
