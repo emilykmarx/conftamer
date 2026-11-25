@@ -1,9 +1,13 @@
-# ConfTamer: log gRPC's method dispatch, for requests served via Server.ServeHTTP, as "Request routed".
-# Without it, a gRPC server mounted on an http.ServeMux (e.g. etcd's grpcHandlerFunc on "/") gets the mux's
-# pattern for every method.
-# Applies to google.golang.org/grpc (made against v1.59.0; same context through v1.75); paths are relative
-# to the module root (patch -p1).
-# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted, with its handler argument).
+# ConfTamer: log grpc-go's server side. Two ways a grpc.Server serves:
+# - Server.ServeHTTP (e.g. etcd's grpcHandlerFunc on a TLS listener's http.ServeMux): net/http (or x/net's HTTP/2
+#   server, patched by x-net-http2-server.sh) logs "Request received" and "Response sent"; this patch logs the
+#   method dispatch as "Request routed" (without it, every method gets the mux's pattern, "/").
+# - Server.Serve, grpc-go's own HTTP/2 server (internal/transport/http2_server.go), which net/http never sees: this
+#   patch gives each stream a context ID and its connection, and logs all three events, with the method's handler.
+# Both log the same events and labels. Applies to google.golang.org/grpc (made against v1.59.0; also applies to
+# v1.65.0, kube-apiserver's vendored copy, with offsets); paths are relative to the module root (patch -p1).
+# Requires the go-inlibrary.patch toolchain (http.ConftamerLogRouted, and the plain-argument server hooks:
+# http.ConftamerServerContext, ConftamerLogServerReceived, ConftamerLogServerRouted, ConftamerLogServerResponse).
 
 --- a/server.go
 +++ b/server.go
@@ -16,42 +20,152 @@
  	if !s.addConn(listenerAddressForServeHTTP, st) {
  		return
  	}
---- /dev/null
+@@ -1730,6 +1732,8 @@
+ 	}
+ 	service := sm[:pos]
+ 	method := sm[pos+1:]
++	// ConfTamer: log a request on grpc-go's own transport (see conftamer.go)
++	s.conftamerLogOwnTransport(ctx, stream)
+ 
+ 	srv, knownService := s.services[service]
+ 	if knownService {
+--- a/conftamer.go
 +++ b/conftamer.go
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,59 @@
 +package grpc
 +
 +import (
++	"context"
 +	"net/http"
 +	"strings"
++
++	"google.golang.org/grpc/internal/transport"
 +)
 +
-+// conftamerLogRouted logs, as "Request routed", the registered method that
-+// handleStream will dispatch r to. The pattern is the full method name
-+// ("/service/method", as r's path); the handler is the method's generated
-+// handler (e.g. etcdserverpb._KV_Range_Handler). Unknown services and methods
-+// aren't logged, so they keep the pattern of the router that passed r to s.
-+//
-+// Only requests served via ServeHTTP are logged: those reached s through
-+// net/http, which logged their "Request received". Requests on s's own
-+// transport (Serve) have no such event to attach a route to.
-+func (s *Server) conftamerLogRouted(r *http.Request) {
-+	sm := strings.TrimPrefix(r.URL.Path, "/")
++// conftamerHandler is the registered method that handleStream dispatches a
++// request for path ("/service/method") to: the method's generated handler (e.g.
++// etcdserverpb._KV_Range_Handler), or nil for an unknown service or method.
++func (s *Server) conftamerHandler(path string) any {
++	sm := strings.TrimPrefix(path, "/")
 +	pos := strings.LastIndex(sm, "/")
 +	if pos == -1 {
-+		return
++		return nil
 +	}
 +	srv, ok := s.services[sm[:pos]]
 +	if !ok {
-+		return
++		return nil
 +	}
-+	var handler any
 +	if md, ok := srv.methods[sm[pos+1:]]; ok {
-+		handler = md.Handler
-+	} else if sd, ok := srv.streams[sm[pos+1:]]; ok {
-+		handler = sd.Handler
-+	} else {
++		return md.Handler
++	}
++	if sd, ok := srv.streams[sm[pos+1:]]; ok {
++		return sd.Handler
++	}
++	return nil
++}
++
++// conftamerLogRouted logs, as "Request routed", the registered method that
++// handleStream will dispatch r to, for requests served via ServeHTTP (those
++// reached s through net/http, which logged their "Request received"). The
++// pattern is the full method name (r's path); the handler, the method's
++// (conftamerHandler). Unknown services and methods aren't logged, so they keep
++// the pattern of the router that passed r to s.
++func (s *Server) conftamerLogRouted(r *http.Request) {
++	if handler := s.conftamerHandler(r.URL.Path); handler != nil {
++		http.ConftamerLogRouted(r.URL.Path, r, handler)
++	}
++}
++
++// conftamerLogOwnTransport logs "Request received" and "Request routed" for a
++// request on grpc-go's own transport (Serve; internal/transport/conftamer.go),
++// which net/http never saw: with the method's handler, so they're identified as
++// the ServeHTTP path's are. Not for other streams (ServeHTTP's: logged already).
++func (s *Server) conftamerLogOwnTransport(ctx context.Context, stream *transport.Stream) {
++	if !transport.ConftamerOwnTransport(ctx) {
 +		return
 +	}
-+	http.ConftamerLogRouted(r.URL.Path, r, handler)
++	path := stream.Method()
++	handler := s.conftamerHandler(path)
++	http.ConftamerLogServerReceived(ctx, http.MethodPost, path, "", handler)
++	if handler != nil {
++		http.ConftamerLogServerRouted(ctx, path, http.MethodPost, path, handler)
++	}
++}
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -617,6 +617,8 @@
+ 			t.updateWindow(s, uint32(n))
+ 		},
+ 	}
++	// ConfTamer: the stream's context ID and connection (see conftamer.go)
++	t.conftamerServerStream(s, mdata)
+ 	// Register the stream with loopy.
+ 	t.controlBuf.put(&registerStream{
+ 		streamID: s.id,
+@@ -1011,6 +1013,7 @@
+ 		t.closeStream(s, true, http2.ErrCodeInternal, false)
+ 		return ErrHeaderListSizeLimitViolation
+ 	}
++	conftamerResponseSent(s) // ConfTamer (see conftamer.go)
+ 	for _, sh := range t.stats {
+ 		// Note: Headers are compressed with hpack after this call returns.
+ 		// No WireLength field is set here.
+@@ -1044,6 +1047,7 @@
+ 				return err
+ 			}
+ 		} else { // Send a trailer only response.
++			conftamerResponseSent(s) // ConfTamer (see conftamer.go)
+ 			headerFields = append(headerFields, hpack.HeaderField{Name: ":status", Value: "200"})
+ 			headerFields = append(headerFields, hpack.HeaderField{Name: "content-type", Value: grpcutil.ContentType(s.contentSubtype)})
+ 		}
+--- a/internal/transport/conftamer.go
++++ b/internal/transport/conftamer.go
+@@ -0,0 +1,48 @@
++package transport
++
++import (
++	"context"
++	"net/http"
++	"strings"
++
++	"google.golang.org/grpc/metadata"
++)
++
++// ConfTamer: requests on grpc-go's own HTTP/2 server (http2Server, as
++// Server.Serve runs it), which net/http never sees. Their context gets a context
++// ID and connection here (conftamerServerStream), "Response sent" is logged here
++// when their headers go out, and "Request received" and "Request routed" are
++// logged by Server.handleStream, which knows the method's handler
++// (ConftamerOwnTransport). Requests served via Server.ServeHTTP go through
++// net/http (and serverHandlerTransport) instead, which logs them.
++
++type conftamerOwnKeyType struct{}
++
++var conftamerOwnKey conftamerOwnKeyType
++
++// conftamerServerStream gives s's context a context ID, its method as the path,
++// its connection and HTTP/2 stream, and its User-Agent (from mdata), and marks
++// it as a stream of this transport.
++func (t *http2Server) conftamerServerStream(s *Stream, mdata metadata.MD) {
++	header := func(name string) string {
++		if v := mdata[strings.ToLower(name)]; len(v) > 0 {
++			return v[0]
++		}
++		return ""
++	}
++	ctx := http.ConftamerServerContext(s.ctx, s.method, t.conn.LocalAddr(), t.conn.RemoteAddr(), s.id, header)
++	s.ctx = context.WithValue(ctx, conftamerOwnKey, true)
++}
++
++// ConftamerOwnTransport reports whether ctx is that of a stream that arrived on
++// grpc-go's own HTTP/2 server (conftamerServerStream).
++func ConftamerOwnTransport(ctx context.Context) bool {
++	own, _ := ctx.Value(conftamerOwnKey).(bool)
++	return own
++}
++
++// conftamerResponseSent logs s's "Response sent", as its headers go out: their
++// :status is always 200 (gRPC's status is in the trailers).
++func conftamerResponseSent(s *Stream) {
++	http.ConftamerLogServerResponse(s.ctx, http.MethodPost, s.method, http.StatusOK)
 +}

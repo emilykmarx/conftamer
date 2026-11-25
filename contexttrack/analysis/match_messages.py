@@ -8,9 +8,13 @@ Each message is reduced to a deduplicated type:
   Response received: (api_id, code, type of the sent request it answers)
 
 Request types pair when api_id and method are equal and the paths are equal
-("matched-exact") or the receiver's route pattern is one it received the
-sender's path under ("matched-pattern").
-Host is used for reference/debugging, not matching.
+("matched-exact") or the receiver's route pattern matches the sender's path
+("matched-pattern"; pattern_matches). Nothing assumes the sender and the
+receiver logged in the same run: not the concrete paths a receiver logged
+under a pattern, nor times or hosts.
+Host is used for reference/debugging, not matching, except that with
+loopback_within (match_requests; not from the command line) a component's
+requests pair with its own only if their host is loopback.
 Response types pair when api_id and code are equal and the requests they
 answer were paired.
 Types with no match get a row with the other side blank.
@@ -41,6 +45,7 @@ _RUNTIME_PLUMBING = {
     "github.com/prometheus/common/route": True, "github.com/emicklei/go-restful": True,
     "github.com/gorilla/mux": True, "k8s.io/apiserver/pkg/server/mux": True,
     "github.com/grafana/grafana/pkg/web": True, "google.golang.org/grpc": True,
+    "github.com/prometheus/common/config": False,
 }
 # Plumbing the runtime doesn't skip, so its "Request sent" events name it as
 # their api_id: gRPC client interceptors (metrics, tracing). Skipped here using
@@ -144,10 +149,66 @@ def caddy_pattern_matches(pattern: str, path: str) -> bool | None:
     return False
 
 
+def specificity(pattern: str) -> int:
+    """How specific a route pattern is: its literal characters
+    (without wildcards: {x}, :x, *x, *), as routers prefer the longest literal
+    match"""
+    pat = strip_pattern(pattern)
+    pat = re.sub(r"\{[^{}]*\}|:[A-Za-z_]\w*|\*[A-Za-z_]\w*|\*", "", pat)
+    return len(pat)
+
+
+def is_subtree(pattern: str) -> bool:
+    """Whether a route pattern matches everything below a prefix (a trailing
+    `/`, `{x...}`, `{x:*}`, `*name` or `*`): a router's fallback, used only
+    when no more specific route matches (most_specific)"""
+    if caddy_pattern_matches(pattern, "") is not None:
+        return False
+    pat = strip_pattern(pattern)
+    return (pat.endswith("/") and not pattern.endswith("{$}")) or bool(
+        re.search(r"(\{[^{}]*(\.\.\.|:\s*\*\s*)\}|\*[A-Za-z_]?\w*)$", pat))
+
+
+def most_specific(exact: list, patterns: list, rcv: "Side") -> list:
+    """Of the receiver types whose patterns match a path (`patterns`), the ones
+    a router would route it to, per receiving component(s): a subtree pattern
+    (is_subtree) only if nothing else matched (neither an exact type, `exact`,
+    nor another pattern); then the most specific (specificity). A receiver can log one request under its path and under its
+    pattern (e.g. kube-apiserver's leases): those patterns stay"""
+    by_comp: dict = defaultdict(list)
+    for r in patterns:
+        by_comp[frozenset(rcv.components[r])].append(r)
+    out = []
+    for comp, rs in by_comp.items():
+        if any(frozenset(rcv.components[r]) == comp for r in exact) or not all(is_subtree(r[3]) for r in rs):
+            rs = [r for r in rs if not is_subtree(r[3])]
+        if rs:
+            top = max(specificity(r[3]) for r in rs)
+            out += [r for r in rs if specificity(r[3]) == top]
+    return out
+
+
 def pattern_matches(pattern: str, path: str) -> bool:
-    """Whether route `pattern` matches concrete `path`. Handles ServeMux
-    {x}, {x...}, {$} and trailing-"/" subtrees, go-restful {x:*} and {x:regex},
-    httprouter :x and *x, and Caddy's matcher patterns."""
+    """Whether route `pattern` matches concrete `path`: the whole path must
+    match. In `pattern`:
+    - ServeMux's `{x}` matches one segment (`[^/]+`); `{x...}` and go-restful's
+      `{x:*}` match anything, slashes included; go-restful's `{x:<regex>}`
+      matches the regex; the name in the braces doesn't matter;
+    - `{$}` at the end matches nothing more (no subtree, below);
+    - httprouter's `:name` (a colon and an identifier), anywhere, matches one
+      segment; so does a literal colon in a path (`services/alertmanager:am-web`
+      matches `services/alertmanager<anything>-web`);
+    - httprouter's `*name` at the end (catch-all) matches anything, and so does
+      a bare `*` at the end (e.g. chi's `/hello/*`);
+    - a trailing `/` also matches everything below it (ServeMux subtree),
+      unless the pattern ends in `{$}`, and the path without that `/` (e.g.
+      kube-apiserver's `/version/` and Grafana's `/api/search/` get `/version`
+      and `/api/search`);
+    - a pattern that is exactly `*`, or starts with `<name>=`, is a Caddy
+      matcher pattern (caddy_pattern_matches; so `*` alone matches every path);
+    - text before the first `/` is dropped (ServeMux patterns can lead with a
+      method and host: strip_pattern);
+    - everything else, regex characters included, is literal."""
     caddy = caddy_pattern_matches(pattern, path)
     if caddy is not None:
         return caddy
@@ -166,8 +227,9 @@ def pattern_matches(pattern: str, path: str) -> bool:
     rx = re.sub(r"\\\{[^}]*\\\}", "[^/]+", rx)             # {x}
     rx = re.sub(r":[A-Za-z_]\w*", "[^/]+", rx)             # :x
     rx = re.sub(r"\\\*[A-Za-z_]\w*$", ".*", rx)            # *x
+    rx = re.sub(r"\\\*$", ".*", rx)                         # * at the end
     if pat.endswith("/") and not pattern.endswith("{$}"):
-        rx += ".*"
+        rx = rx[:-1] + "(?:/.*)?"
     return re.fullmatch(rx, path) is not None
 
 
@@ -195,6 +257,13 @@ class Side:
         self.paths: dict[tuple, set] = defaultdict(set)  # concrete paths per type
         self.first: dict[tuple, int] = {}  # earliest and latest event timestamp (ns) per type
         self.last: dict[tuple, int] = {}
+        # From the server side's conn (received requests): the clients' IPs per
+        # type, and the types some message of which came from the receiver's own
+        # IP (remote IP == local IP: the component sent it to itself)
+        self.client_ips: dict[tuple, set] = defaultdict(set)
+        # The clients as (IP, User-Agent, kubectl command) (the server side's user_agent and kubectl_command)
+        self.client_agents: dict[tuple, set] = defaultdict(set)
+        self.self_sent: set[tuple] = set()
 
     def add(self, typ: tuple, comp: str, path: str | None = None, ts: int | None = None,
             node: str = "", conn: dict | None = None) -> None:
@@ -210,9 +279,32 @@ class Side:
             self.first[typ] = min(ts, self.first.get(typ, ts))
             self.last[typ] = max(ts, self.last.get(typ, ts))
 
+    def add_server_conn(self, typ: tuple, conn: dict | None, user_agent: str | None = None,
+                        kubectl_command: str | None = None) -> None:
+        """Records a received request's connection (its event's conn): the
+        client's IP, and whether it is the receiver's own. A loopback IP isn't:
+        a port-forward's and a command's in the container (kubectl exec) come
+        from 127.0.0.1 to 127.0.0.1 too (and a component's own loopback
+        requests pair by their host: match_requests)."""
+        if not conn or not conn.get("remote"):
+            return
+        remote = _ip(conn["remote"])
+        self.client_ips[typ].add(remote)
+        self.client_agents[typ].add((remote, user_agent or "", kubectl_command or ""))
+        if conn.get("local") and _ip(conn["local"]) == remote and not is_loopback(remote):
+            self.self_sent.add(typ)
 
-def collect(path: Path, sides: dict[str, Side]) -> None:
-    """Add the types of every message in one events file to `sides`."""
+
+def _ip(addr: str) -> str:
+    """'10.0.0.1:80' -> '10.0.0.1', '[::1]:80' -> '::1'"""
+    host = addr.rsplit(":", 1)[0] if addr.count(":") == 1 or addr.startswith("[") else addr
+    return host.strip("[]")
+
+
+def collect(path: Path, sides: dict[str, Side], on_message=None) -> None:
+    """Add the types of every message in one events file to `sides`.
+    on_message(side name, type, event), if given, is called for each message
+    event with the type it was added as."""
     comp = component(path)
     # <node>/pods/<pod>.jsonl or <node>/<process>.jsonl, as deploy.sh collects them
     node = path.parent.parent.name if path.parent.name == "pods" else path.parent.name
@@ -229,10 +321,13 @@ def collect(path: Path, sides: dict[str, Side]) -> None:
         group = (ev.get("pid"), (ev.get("context") or {}).get("context_id"))
         if kind == "Request sent":
             sent[group].append(ev)
-            sides["snd_req"].add(_sent_req_type(ev), comp, ts=ev.get("ts"), node=node, conn=ev.get("conn"))
+            typ = _sent_req_type(ev)
+            sides["snd_req"].add(typ, comp, ts=ev.get("ts"), node=node, conn=ev.get("conn"))
         elif kind == "Request received":
             recvd[group].append(ev)
-            sides["rcv_req"].add(_recvd_req_type(ev), comp, msg.get("req.URL.Path"), ev.get("ts"))
+            typ = _recvd_req_type(ev)
+            sides["rcv_req"].add(typ, comp, msg.get("req.URL.Path"), ev.get("ts"))
+            sides["rcv_req"].add_server_conn(typ, ev.get("conn"), ev.get("user_agent"), ev.get("kubectl_command"))
         elif kind == "Response sent":
             # Match on method and path, else the only request in the context:
             # handlers may rewrite the path before responding (e.g. Prometheus serveDebug)
@@ -240,7 +335,9 @@ def collect(path: Path, sides: dict[str, Side]) -> None:
             if not reqs and len(recvd[group]) == 1:
                 reqs = recvd[group]
             req = _recvd_req_type(reqs[-1]) if reqs else _NO_REQ
-            sides["snd_resp"].add((req[0], msg.get("code", ""), req), comp, ts=ev.get("ts"))
+            typ = (req[0], msg.get("code", ""), req)
+            sides["snd_resp"].add(typ, comp, ts=ev.get("ts"))
+            sides["snd_resp"].add_server_conn(typ, ev.get("conn"), ev.get("user_agent"), ev.get("kubectl_command"))
         elif kind == "Response received":
             reqs = [r for r in sent[group] if _req_identity(r) == _req_identity(ev)]
             req = _sent_req_type(reqs[-1]) if reqs else _NO_REQ
@@ -250,25 +347,66 @@ def collect(path: Path, sides: dict[str, Side]) -> None:
             # own api_id can name a wrapper (e.g. golang.org for parca), and
             # transport-only responses (direct RoundTrip) carry none
             api_id = req[0] or ev.get("api_id", "")
-            sides["rcv_resp"].add((api_id, msg.get("resp.StatusCode", ""), req), comp, ts=ev.get("ts"),
-                                  node=node, conn=conn)
+            typ = (api_id, msg.get("resp.StatusCode", ""), req)
+            sides["rcv_resp"].add(typ, comp, ts=ev.get("ts"), node=node, conn=conn)
+        else:
+            continue
+        if on_message:
+            on_message(_SIDE_OF[kind], typ, ev)
 
 
-def match_requests(snd: Side, rcv: Side) -> list[tuple]:
-    """(status, sender type, receiver type) for every request type."""
+# Event kind -> the Side its types are added to (collect)
+_SIDE_OF = {"Request sent": "snd_req", "Request received": "rcv_req",
+            "Response sent": "snd_resp", "Response received": "rcv_resp"}
+
+
+def is_loopback(host: str) -> bool:
+    """Whether a request's host (host[:port], IPv6 in brackets) is this machine:
+    127.0.0.0/8, ::1 or localhost."""
+    h = _ip(host).lower()
+    return h == "localhost" or h == "::1" or h.startswith("127.")
+
+
+def match_requests(snd: Side, rcv: Side, loopback_within: bool = False) -> list[tuple]:
+    """(status, sender type, receiver type) for every request type.
+
+    loopback_within: a sender and a receiver type logged only by the same
+    component pair only if the request's host is loopback (is_loopback), or
+    the receiver logged the type from its own IP (Side.self_sent: needs the
+    server side's conn): for components that each are one process, which
+    sends to itself only those ways (e.g. Prometheus scraping itself at its
+    pod IP). It's a rule about one component's own messages only: a request
+    to a loopback host pairs with other components' types as any request
+    does, by type, since which components share a network namespace depends
+    on the testbed (the sender's and the receiver's events can come from
+    separate runs). Without it, a proxy's forwarded request pairs with the request it received
+    (both carry the proxy's api_id and route). Off by default: a component
+    named after a container can be several pods (component), which do send to
+    each other."""
     by_key = defaultdict(list)  # (api_id, method) -> receiver types
     for r in rcv.n:
         by_key[r[:2]].append(r)
     rows, matched = [], set()
     for s in snd.n:
         cands = by_key[s[:2]]
+        if loopback_within and not is_loopback(s[2]):
+            # (types can span components: unless both are the same one, some
+            # sender component differs from some receiver component)
+            cands = [r for r in cands if r in rcv.self_sent
+                     or not (len(snd.components[s]) == 1 and snd.components[s] == rcv.components[r])]
         # A receiver can log the same request under its path and, when routed,
-        # under its pattern (e.g. kube-apiserver's leases), so take both. A
-        # pattern counts only if the receiver logged this path under it: a
-        # catch-all (ServeMux "/", "/api/") matches every path, but receives few.
+        # under its pattern (e.g. kube-apiserver's leases), so take both. The
+        # pattern decides, not the paths the receiver happened to log under it:
+        # the client's and the server's events can come from separate runs
+        # (e.g. a testbed and the server's own tests), whose IDs in paths
+        # differ. A catch-all pattern (ServeMux "/") matches every path; the
+        # api_id, equal on both sides, is what keeps it to its own library's.
+        # Of the patterns a receiver matches the path with, only those a router
+        # would route it to (most_specific): e.g. not kube-apiserver's "/api/"
+        # prefix (its discovery requests, GET /api) for GET /api/v1/pods.
         hits = [("matched-exact", r) for r in cands if r[3] == s[3]]
-        hits += [("matched-pattern", r) for r in cands if r[3] != s[3] and (
-            s[3] in rcv.paths[r] if rcv.paths[r] else pattern_matches(r[3], s[3]))]
+        hits += [("matched-pattern", r) for r in most_specific(
+            [r for _, r in hits], [r for r in cands if r[3] != s[3] and pattern_matches(r[3], s[3])], rcv)]
         for status, r in hits:
             rows.append((status, s, r))
             matched.add(r)
@@ -299,7 +437,7 @@ FIELDS = ["message", "status",
           "snd_api_id", "snd_method", "snd_host", "snd_path", "snd_code", "snd_n",
           "rcv_api_id", "rcv_method", "rcv_host", "rcv_path", "rcv_code", "rcv_n",
           "snd_components", "rcv_components", "example_paths",
-          "same_path_other_api_ids", "server_paths",
+          "same_path_other_api_ids", "server_paths", "client_ips", "client_agents",
           "snd_first_ts", "snd_last_ts", "rcv_first_ts", "rcv_last_ts",
           "snd_type_id", "rcv_type_id"]
 
@@ -329,8 +467,9 @@ def _other_api_ids(typ: tuple, others: Side, is_resp: bool) -> str:
     return ";".join(sorted(i or "(none)" for i in ids))
 
 
-def build_rows(sides: dict[str, Side]) -> list[dict]:
-    req_rows = match_requests(sides["snd_req"], sides["rcv_req"])
+def build_rows(sides: dict[str, Side], loopback_within: bool = False) -> list[dict]:
+    """loopback_within: see match_requests"""
+    req_rows = match_requests(sides["snd_req"], sides["rcv_req"], loopback_within)
     req_pairs = {(s, r) for status, s, r in req_rows if status.startswith("matched")}
     resp_rows = match_responses(sides["snd_resp"], sides["rcv_resp"], req_pairs)
 
@@ -351,6 +490,16 @@ def build_rows(sides: dict[str, Side]) -> list[dict]:
             server_req = (s[2] if s else None) if is_resp else r
             if server_req is not None:
                 row["server_paths"] = ";".join(sorted(sides["rcv_req"].paths[server_req]))
+                # The clients' IPs (the server side's conn): of a response type, those
+                # its responses went to; else those the request type came from
+                ips = (sides["snd_resp"].client_ips[s] if is_resp and s else set()) \
+                    or sides["rcv_req"].client_ips[server_req]
+                row["client_ips"] = ";".join(sorted(ips))
+                # The same clients with their User-Agents and kubectl commands: JSON [[ip, user_agent,
+                # kubectl_command], ...]
+                agents = (sides["snd_resp"].client_agents[s] if is_resp and s else set()) \
+                    or sides["rcv_req"].client_agents[server_req]
+                row["client_agents"] = json.dumps(sorted(agents)) if agents else ""
             if status == "unmatched-sender":
                 row["same_path_other_api_ids"] = _other_api_ids(s, rcv, is_resp)
             elif status == "unmatched-receiver":
